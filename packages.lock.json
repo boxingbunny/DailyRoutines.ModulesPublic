@@ -4,9 +4,9 @@
     "net10.0-windows7.0": {
       "DailyRoutines.CodeAnalysis": {
         "type": "Direct",
-        "requested": "[2.3.0, )",
-        "resolved": "2.3.0",
-        "contentHash": "kM5tXWU3mOdBRUy5P2ENSwobFn1mRa4bUaUY7aRmDNysWsjofEcAFyKPJP5qyevBr+PKHq9OVMYCxREnnLpotg=="
+        "requested": "[2.4.0, )",
+        "resolved": "2.4.0",
+        "contentHash": "+G2MANDREROWvWMFQ3Ft+G0/zoDsNh3sQ4etCNysvC73JctGos6Wn4fvB//ZLCXOmxTsFDFD4q59yjSG28RvQA=="
       },
       "DotNet.ReproducibleBuilds": {
         "type": "Direct",
@@ -19,6 +19,92 @@
         "requested": "[1.1.0, )",
         "resolved": "1.1.0",
         "contentHash": "vECozrzeWThMPPXtBdpATwfh+5eGqboZILOYYckSVZSn54JC6L+fdfB307Xu2UDtPvB4kx/tfwGy5+1VgkATfA=="
+      },
+      "TinyPinyin": {
+        "type": "Direct",
+        "requested": "[1.1.0, )",
+        "resolved": "1.1.0",
+        "contentHash": "pwe99NXsWkSeJdOwzcweorlyoB2frOlTU37QwzmnnxfRT5vRENXm4UOl5g4Nxq5V9lYOBWK1mZIozFfIlDVjYA=="
+      },
+      "DalamudPackager": {
+        "type": "Transitive",
+        "resolved": "15.0.0",
+        "contentHash": "411vwC8/X8Z/sQ2TI6v3SvOn66xFPeOjFn3Zn+h0d3Ox2t1kFm66AhDvmx/qcMwVrR+Hidxj0dadpQ2dgyXMBQ=="
+      },
+      "GuerrillaNtp": {
+        "type": "Transitive",
+        "resolved": "3.1.0",
+        "contentHash": "KebM3/iZtZWgeFuGTQJyWu+VQKAeq1xXY9bkSSDv27hALxDtSdJAfPnT8dWpl7ti2B3ajnMj70/VLXY4D3bupg=="
+      },
+      "Microsoft.CodeAnalysis.Analyzers": {
+        "type": "Transitive",
+        "resolved": "3.11.0",
+        "contentHash": "v/EW3UE8/lbEYHoC2Qq7AR/DnmvpgdtAMndfQNmpuIMx/Mto8L5JnuCfdBYtgvalQOtfNCnxFejxuRrryvUTsg=="
+      },
+      "Microsoft.CodeAnalysis.Common": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "ZXRAdvH6GiDeHRyd3q/km8Z44RoM6FBWHd+gen/la81mVnAdHTEsEkO5J0TCNXBymAcx5UYKt5TvgKBhaLJEow==",
+        "dependencies": {
+          "Microsoft.CodeAnalysis.Analyzers": "3.11.0"
+        }
+      },
+      "Microsoft.CodeAnalysis.CSharp": {
+        "type": "Transitive",
+        "resolved": "5.0.0",
+        "contentHash": "5DSyJ9bk+ATuDy7fp2Zt0mJStDVKbBoiz1DyfAwSa+k4H4IwykAUcV3URelw5b8/iVbfSaOwkwmPUZH6opZKCw==",
+        "dependencies": {
+          "Microsoft.CodeAnalysis.Analyzers": "3.11.0",
+          "Microsoft.CodeAnalysis.Common": "[5.0.0]"
+        }
+      },
+      "Otp.NET": {
+        "type": "Transitive",
+        "resolved": "1.4.1",
+        "contentHash": "UXjZ80T6BfVACJWmEcz4UFZ93hwX3STKojKvVpPk3qUhubjnLwIiZMsI4Hh91HhYxC0JlatNdNrVK2wkv4O9/Q=="
+      },
+      "System.Management": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "/mywt9LtfYM+QbnIPPqdES/qWWU3tkorSDHPX99KYhCTtxdjGFmLcz7QwpAAeBKU0o+rZzEcpKZlrtEr1Xq39g=="
+      },
+      "dailyroutines": {
+        "type": "Project",
+        "dependencies": {
+          "DailyRoutines.Common": "[1.0.0, )",
+          "DalamudPackager": "[15.0.0, )",
+          "KamiToolKit": "[1.0.0, )",
+          "Microsoft.CodeAnalysis.CSharp": "[5.0.0, )",
+          "OmenTools": "[1.0.0, )",
+          "Otp.NET": "[1.4.1, )",
+          "RSASharp": "[1.0.0, )",
+          "System.Management": "[10.0.1, )",
+          "TimeAgo.Core": "[1.1.0, )",
+          "TinyPinyin": "[1.1.0, )"
+        }
+      },
+      "dailyroutines.common": {
+        "type": "Project",
+        "dependencies": {
+          "KamiToolKit": "[1.0.0, )",
+          "Microsoft.CodeAnalysis.CSharp": "[5.0.0, )",
+          "OmenTools": "[1.0.0, )",
+          "TimeAgo.Core": "[1.1.0, )",
+          "TinyPinyin": "[1.1.0, )"
+        }
+      },
+      "kamitoolkit": {
+        "type": "Project"
+      },
+      "omentools": {
+        "type": "Project",
+        "dependencies": {
+          "GuerrillaNtp": "[3.1.0, )",
+          "TinyPinyin": "[1.1.0, )"
+        }
+      },
+      "rsasharp": {
+        "type": "Project"
       }
     }
   }

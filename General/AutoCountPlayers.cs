@@ -1,115 +1,124 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.Collections.Frozen;
 using System.Numerics;
-using System.Text;
-using DailyRoutines.Abstracts;
-using DailyRoutines.Managers;
+using DailyRoutines.Common.Info.Models;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
+using DailyRoutines.Manager;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Gui.Dtr;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Hooking;
 using Dalamud.Interface.Utility;
-using Dalamud.Plugin.Services;
-using FFXIVClientStructs.FFXIV.Client.Game.Control;
-using FFXIVClientStructs.FFXIV.Client.System.Framework;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel.Sheets;
+using OmenTools.Info.Lumina;
+using OmenTools.Interop.Game.Helpers;
+using OmenTools.Interop.Game.Lumina;
+using OmenTools.OmenService;
+using OmenTools.Threading;
+using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 using TerritoryIntendedUse = FFXIVClientStructs.FFXIV.Client.Enums.TerritoryIntendedUse;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class AutoCountPlayers : DailyModuleBase
+public unsafe class AutoCountPlayers : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoCountPlayersTitle"),
-        Description = GetLoc("AutoCountPlayersDescription"),
-        Category    = ModuleCategories.General
+        Title       = Lang.Get("AutoCountPlayersTitle"),
+        Description = Lang.Get("AutoCountPlayersDescription"),
+        Category    = ModuleCategory.General
     };
 
     public override ModulePermission Permission { get; } = new() { AllDefaultEnabled = true };
 
-    private const ImGuiWindowFlags WINDOW_FLAGS = ImGuiWindowFlags.NoScrollbar           |
-                                                  ImGuiWindowFlags.AlwaysAutoResize      |
-                                                  ImGuiWindowFlags.NoTitleBar            |
-                                                  ImGuiWindowFlags.NoBackground          |
-                                                  ImGuiWindowFlags.NoBringToFrontOnFocus |
-                                                  ImGuiWindowFlags.NoFocusOnAppearing    |
-                                                  ImGuiWindowFlags.NoNavFocus            |
-                                                  ImGuiWindowFlags.NoDocking             |
-                                                  ImGuiWindowFlags.NoMove                |
-                                                  ImGuiWindowFlags.NoResize              |
-                                                  ImGuiWindowFlags.NoScrollWithMouse     |
-                                                  ImGuiWindowFlags.NoInputs;
+    private static bool IsPlayerSearchLocation =>
+        IsContentSearchZone || IsPlayerSearchZone;
 
-    private static readonly uint LineColorBlue = KnownColor.LightSkyBlue.ToUInt();
-    private static readonly uint LineColorRed  = KnownColor.Red.ToUInt();
-    private static readonly uint DotColor      = KnownColor.RoyalBlue.ToUInt();
+    private static bool IsContentSearchZone =>
+        ContentMemberListValidZones.Contains(GameState.TerritoryIntendedUse);
 
-    private delegate void InfoProxy24EndRequestDelegate(InfoProxy24* instance);
-    private static Hook<InfoProxy24EndRequestDelegate> InfoProxy24EndRequestHook;
+    private static bool IsPlayerSearchZone =>
+        GameState.TerritoryType > 0 && 
+        GameState.ContentFinderCondition == 0 &&
+        Sheets.PlayerSearchPlaceNames.ContainsKey(GameState.TerritoryTypeData.PlaceNameZone.RowId);
+    
+    private Hook<InfoProxyContentMember.Delegates.EndRequest>? InfoProxyContentMemberEndRequestHook;
+    private Hook<InfoProxySearch.Delegates.EndRequest>?        InfoProxySearchEndRequestHook;
 
-    private static Config        ModuleConfig = null!;
-    private static IDtrBarEntry? Entry;
+    private Config        config = null!;
+    private IDtrBarEntry? entry;
 
-    private static readonly Dictionary<uint, byte[]> JobIcons = [];
-    private static readonly Dictionary<uint, PlayerTargetingInfo> LastTargetingData = [];
+    private readonly Dictionary<uint, byte[]>              jobIcons          = [];
+    private readonly Dictionary<uint, PlayerTargetingInfo> lastTargetingData = [];
 
-    private static string SearchInput = string.Empty;
+    private string searchInput     = string.Empty;
+    private string searchZoneInput = string.Empty;
 
     protected override void Init()
     {
-        ModuleConfig = LoadConfig<Config>() ?? new();
+        config = Config.Load(this) ?? new();
 
-        Overlay            ??= new(this);
-        Overlay.Flags      &=  ~ImGuiWindowFlags.NoTitleBar;
-        Overlay.Flags      &=  ~ImGuiWindowFlags.AlwaysAutoResize;
-        Overlay.WindowName =   $"{GetLoc("AutoCountPlayers-PlayersAroundInfo")}###AutoCountPlayers-Overlay";
+        entry       ??= DService.Instance().DTRBar.Get("DailyRoutines-AutoCountPlayers");
+        entry.Shown =   true;
+        entry.Text  =   $"{Lang.Get("AutoCountPlayers-PlayersAroundCount")}: 0";
+        entry.OnClick = _ =>
+        {
+            EnsureOverlay();
+            Overlay.IsOpen ^= true;
+        };
 
-        Entry         ??= DService.Instance().DTRBar.Get("DailyRoutines-AutoCountPlayers");
-        Entry.Shown   =   true;
-        Entry.Text    =   $"{GetLoc("AutoCountPlayers-PlayersAroundCount")}: 0";
-        Entry.OnClick +=  _ => Overlay.IsOpen ^= true;
+        WindowManager.Instance().PostDraw += OnDraw;
 
-        WindowManager.Draw += OnDraw;
+        PlayersManager.Instance().ReceivePlayersAround      += OnReceivePlayers;
+        PlayersManager.Instance().ReceivePlayersTargetingMe += OnPlayersTargetingMeUpdate;
 
-        PlayersManager.ReceivePlayersAround      += OnReceivePlayers;
-        PlayersManager.ReceivePlayersTargetingMe += OnPlayersTargetingMeUpdate;
-
-        var instance = (InfoProxy24*)InfoModule.Instance()->GetInfoProxyById((InfoProxyId)24);
-        InfoProxy24EndRequestHook ??= instance->VirtualTable->HookVFuncFromName
+        InfoProxyContentMemberEndRequestHook = InfoProxyContentMember.Instance()->VirtualTable->HookVFuncFromName
         (
             "EndRequest",
-            (InfoProxy24EndRequestDelegate)InfoProxy24EndRequestDetour
+            (InfoProxyContentMember.Delegates.EndRequest)InfoProxyContentMemberRequestDetour
         );
-        InfoProxy24EndRequestHook.Enable();
+        InfoProxyContentMemberEndRequestHook.Enable();
+        
+        InfoProxySearchEndRequestHook = InfoProxySearch.Instance()->VirtualTable->HookVFuncFromName
+        (
+            "EndRequest",
+            (InfoProxySearch.Delegates.EndRequest)InfoProxySearchRequestDetour
+        );
+        InfoProxySearchEndRequestHook.Enable();
 
-        DService.Instance().ClientState.TerritoryChanged += OnZoneChanged;
-        FrameworkManager.Instance().Reg(OnUpdate, 10_000);
+        LogMessageManager.Instance().RegPre(OnLogMessage);
+        FrameworkManager.Instance().Reg(OnUpdate, throttleMS: 1_000);
         OnUpdate(DService.Instance().Framework);
+
+        IClientState.Instance().TerritoryChanged += OnZoneChanged;
     }
 
     protected override void Uninit()
     {
-        DService.Instance().ClientState.TerritoryChanged -= OnZoneChanged;
+        IClientState.Instance().TerritoryChanged -= OnZoneChanged;
 
         FrameworkManager.Instance().Unreg(OnUpdate);
+        LogMessageManager.Instance().Unreg(OnLogMessage);
 
-        WindowManager.Draw                       -= OnDraw;
-        PlayersManager.ReceivePlayersAround      -= OnReceivePlayers;
-        PlayersManager.ReceivePlayersTargetingMe -= OnPlayersTargetingMeUpdate;
+        WindowManager.Instance().PostDraw                   -= OnDraw;
+        PlayersManager.Instance().ReceivePlayersAround      -= OnReceivePlayers;
+        PlayersManager.Instance().ReceivePlayersTargetingMe -= OnPlayersTargetingMeUpdate;
 
-        foreach (var info in LastTargetingData.Values)
+        foreach (var info in lastTargetingData.Values)
         {
             var duration = DateTime.Now - info.TargetingStartTime;
-            ModuleConfig.TargetingHistories.Add
+            config.TargetingHistories.Add
             (
                 new()
                 {
-                    Name        = info.Player.Name.ToString(),
+                    Name        = info.Player.Name,
                     HomeWorldID = info.Player.HomeWorld.RowId,
                     JobID       = info.Player.ClassJob.RowId,
                     StartTime   = info.TargetingStartTime,
@@ -118,57 +127,57 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                 }
             );
         }
-        
-        if (LastTargetingData.Count > 0)
+
+        if (lastTargetingData.Count > 0)
         {
-            LastTargetingData.Clear();
-            if (ModuleConfig.TargetingHistories.Count > 100)
-                ModuleConfig.TargetingHistories.RemoveRange(0, ModuleConfig.TargetingHistories.Count - 100);
-            ModuleConfig.Save(this);
+            lastTargetingData.Clear();
+            if (config.TargetingHistories.Count > 100)
+                config.TargetingHistories.RemoveRange(0, config.TargetingHistories.Count - 100);
+            config.Save(this);
         }
 
-        Entry?.Remove();
-        Entry = null;
+        entry?.Remove();
+        entry = null;
     }
 
     protected override void ConfigUI()
     {
-        ImGui.SetNextItemWidth(120f * GlobalFontScale);
-        if (ImGui.InputFloat(GetLoc("Scale"), ref ModuleConfig.ScaleFactor, 0, 0, "%.1f"))
-            ModuleConfig.ScaleFactor = Math.Max(0.1f, ModuleConfig.ScaleFactor);
+        ImGui.SetNextItemWidth(120f * GlobalUIScale);
+        if (ImGui.InputFloat(Lang.Get("Scale"), ref config.ScaleFactor, 0, 0, "%.1f"))
+            config.ScaleFactor = Math.Max(0.1f, config.ScaleFactor);
         if (ImGui.IsItemDeactivatedAfterEdit())
-            ModuleConfig.Save(this);
+            config.Save(this);
 
         ImGui.NewLine();
 
-        if (ImGui.Checkbox(GetLoc("AutoCountPlayers-DisplayLineWhenTargetingMe"), ref ModuleConfig.DisplayLineWhenTargetingMe))
-            ModuleConfig.Save(this);
+        if (ImGui.Checkbox(Lang.Get("AutoCountPlayers-DisplayLineWhenTargetingMe"), ref config.DisplayLineWhenTargetingMe))
+            config.Save(this);
 
-        if (ModuleConfig.DisplayLineWhenTargetingMe)
+        if (config.DisplayLineWhenTargetingMe)
         {
             using (ImRaii.PushIndent())
             {
-                if (ImGui.Checkbox(GetLoc("SendChat"), ref ModuleConfig.SendChat))
-                    ModuleConfig.Save(this);
+                if (ImGui.Checkbox(Lang.Get("SendChat"), ref config.SendChat))
+                    config.Save(this);
 
-                if (ImGui.Checkbox(GetLoc("SendNotification"), ref ModuleConfig.SendNotification))
-                    ModuleConfig.Save(this);
+                if (ImGui.Checkbox(Lang.Get("SendNotification"), ref config.SendNotification))
+                    config.Save(this);
 
-                if (ImGui.Checkbox(GetLoc("SendTTS"), ref ModuleConfig.SendTTS))
-                    ModuleConfig.Save(this);
+                if (ImGui.Checkbox(Lang.Get("SendTTS"), ref config.SendTTS))
+                    config.Save(this);
 
-                if (ModuleConfig.SendNotification || ModuleConfig.SendTTS)
+                if (config.SendNotification || config.SendTTS)
                 {
                     using (ImRaii.PushIndent())
                     {
-                        if (ImGui.Checkbox(GetLoc("AutoCountPlayers-FilterFriend"), ref ModuleConfig.FilterFriend))
-                            ModuleConfig.Save(this);
+                        if (ImGui.Checkbox(Lang.Get("AutoCountPlayers-FilterFriend"), ref config.FilterFriend))
+                            config.Save(this);
                     }
                 }
             }
         }
 
-        
+
     }
 
     protected override void OverlayUI()
@@ -176,33 +185,33 @@ public unsafe class AutoCountPlayers : DailyModuleBase
         using var tabBar = ImRaii.TabBar("##Tab");
         if (!tabBar) return;
 
-        using (var item = ImRaii.TabItem(GetLoc("AutoCountPlayers-PlayersAround")))
+        using (var item = ImRaii.TabItem(Lang.Get("AutoCountPlayers-PlayersAround")))
         {
             if (item)
             {
                 ImGui.SetNextItemWidth(-1f);
-                ImGui.InputText("###Search", ref SearchInput, 128);
+                ImGui.InputText("###Search", ref searchInput, 128);
 
-                if (BetweenAreas) return;
+                if (DService.Instance().Condition.IsBetweenAreas) return;
 
                 using var child = ImRaii.Child("列表", ImGui.GetContentRegionAvail() - ImGui.GetStyle().ItemSpacing, true);
                 if (!child) return;
 
-                foreach (var playerAround in PlayersManager.PlayersAround)
+                foreach (var playerAround in PlayersManager.Instance().PlayersAround)
                 {
                     using var id = ImRaii.PushId($"{playerAround.GameObjectID}");
-                    
-                    if (!string.IsNullOrWhiteSpace(SearchInput) && !playerAround.Name.ToString().Contains(SearchInput)) continue;
 
-                    if (ImGuiOm.ButtonIcon("定位", FontAwesomeIcon.Flag, GetLoc("Locate")))
+                    if (!string.IsNullOrWhiteSpace(searchInput) && !playerAround.Name.Contains(searchInput)) continue;
+
+                    if (ImGuiOm.ButtonIcon("定位", FontAwesomeIcon.Flag, Lang.Get("Locate")))
                     {
-                        var mapPos = WorldToMap(playerAround.Position.ToVector2(), GameState.MapData);
+                        var mapPos = PositionHelper.WorldToMap(playerAround.Position.ToVector2(), GameState.MapData);
                         var message = new SeStringBuilder()
                                       .Add
                                       (
                                           new PlayerPayload
                                           (
-                                              playerAround.Name.TextValue,
+                                              playerAround.Name,
                                               playerAround.ToStruct()->HomeWorld
                                           )
                                       )
@@ -213,45 +222,104 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                                       .Append("     ")
                                       .Append(SeString.CreateMapLink(GameState.TerritoryType, GameState.Map, mapPos.X, mapPos.Y))
                                       .Build();
-                        Chat(message);
+
+                        // TODO: 改成 ReadOnlyString
+                        NotifyHelper.Instance().Chat(message.Encode());
                     }
 
-                    if (DService.Instance().GameGUI.WorldToScreen(playerAround.Position,            out var screenPos) &&
-                        DService.Instance().GameGUI.WorldToScreen(LocalPlayerState.Object.Position, out var localScreenPos))
+                    var gameGUI  = DService.Instance().GameGUI;
+                    var viewport = ImGui.GetMainViewport();
+
+                    gameGUI.WorldToScreen(playerAround.Position, out var screenPos, out var isInView);
+
+                    if (!gameGUI.WorldToScreen(LocalPlayerState.Object.Position, out var localScreenPos, out _))
+                        localScreenPos = viewport.Pos + new Vector2(viewport.Size.X * 0.5f, viewport.Size.Y);
+
+                    if (!ImGui.IsAnyItemHovered() || ImGui.IsItemHovered())
                     {
-                        if (!ImGui.IsAnyItemHovered() || ImGui.IsItemHovered())
-                            DrawLine(localScreenPos, screenPos, playerAround);
+                        var linePositions = GetLinePositions
+                        (
+                            screenPos,
+                            isInView,
+                            viewport.Pos,
+                            viewport.Size,
+                            OFFSCREEN_MARKER_INSET * GlobalUIScale,
+                            OFFSCREEN_LINE_OVERFLOW * GlobalUIScale
+                        );
+
+                        DrawLine(localScreenPos, linePositions.LineEnd, linePositions.Marker, playerAround, isInView);
                     }
 
+                    if (DService.Instance().Texture.TryGetFromGameIcon(playerAround.ClassJob.Value.GetIcon(), out var texture))
+                    {
+                        ImGui.SameLine();
+                        ImGui.Image(texture.GetWrapOrEmpty().Handle, new(ImGui.GetFrameHeight()));
+                    }
 
                     ImGui.SameLine();
-                    ImGui.TextUnformatted($"{playerAround.Name} ({playerAround.ClassJob.Value.Name})");
+                    ImGuiOm.RenderPlayerInfo(playerAround.Name, playerAround.HomeWorld.Value.Name.ToString());
                 }
             }
         }
         
-        using (var item = ImRaii.TabItem(GetLoc("AutoCountPlayers-TargetedHistory")))
+        if (IsPlayerSearchLocation)
+        {
+            using var item = ImRaii.TabItem(Lang.Get("AutoCountPlayers-PlayersInZone"));
+            if (item)
+            {
+                ImGui.SetNextItemWidth(-1f);
+                ImGui.InputText("###Search", ref searchZoneInput, 128);
+
+                if (ICondition.Instance().IsBetweenAreas) return;
+
+                using var child = ImRaii.Child("列表", ImGui.GetContentRegionAvail() - ImGui.GetStyle().ItemSpacing, true);
+                if (!child) return;
+                
+                var info = IsPlayerSearchZone ?
+                               (InfoProxyCommonList*)InfoProxySearch.Instance() :
+                               (InfoProxyCommonList*)InfoProxyContentMember.Instance();
+                
+                for (var index = 0; index < info->EntryCount; index++)
+                {
+                    var player = info->CharDataSpan[index];
+                    if (IsPlayerSearchZone && player.Location != GameState.TerritoryType) continue;
+
+                    using var id = ImRaii.PushId($"{player.ContentId}");
+
+                    if (!string.IsNullOrWhiteSpace(searchZoneInput) && !player.NameString.Contains(searchZoneInput)) continue;
+                    
+                    ImGui.Image
+                    (
+                        ITextureProvider.Instance().GetFromGameIcon(LuminaWrapper.GetJobIcon(player.Job)).GetWrapOrEmpty().Handle,
+                        new(ImGui.GetTextLineHeight())
+                    );
+
+                    ImGui.SameLine(0f, 4f * GlobalUIScale);
+                    ImGuiOm.RenderPlayerInfo(player.NameString, LuminaWrapper.GetWorldName(player.HomeWorld));
+                }
+            }
+        }
+
+        using (var item = ImRaii.TabItem(Lang.Get("AutoCountPlayers-TargetedHistory")))
         {
             if (item)
             {
-                foreach (var record in ModuleConfig.TargetingHistories.AsEnumerable().Reverse())
+                foreach (var record in config.TargetingHistories.AsEnumerable().Reverse())
                 {
                     ImGui.TextDisabled($"{record.StartTime:MM/dd HH:mm:ss}");
-                        
-                    ImGui.SameLine();
-                    var jobIcon = JobIcons.GetOrAdd
-                    (
-                        record.JobID,
-                        _ => new SeStringBuilder().AddIcon(record.JobID.ToLuminaRowRef<ClassJob>().Value.ToBitmapFontIcon()).Encode()
-                    );
-                    ImGuiHelpers.SeStringWrapped(jobIcon);
+
+                    if (DService.Instance().Texture.TryGetFromGameIcon(LuminaGetter.GetRowOrDefault<ClassJob>(record.JobID).GetIcon(), out var texture))
+                    {
+                        ImGui.SameLine();
+                        ImGui.Image(texture.GetWrapOrEmpty().Handle, new(ImGui.GetTextLineHeight()));
+                    }
 
                     ImGui.SameLine();
-                    ImGui.TextUnformatted($"{record.Name}@{LuminaWrapper.GetWorldName(record.HomeWorldID)}");
-                        
+                    ImGuiOm.RenderPlayerInfo(record.Name, LuminaWrapper.GetWorldName(record.HomeWorldID));
+
                     ImGui.SameLine();
                     ImGui.TextColored(KnownColor.Orange.ToVector4(), $"[{record.Duration:mm\\:ss}]");
-                    
+
                     ImGui.SameLine();
                     ImGui.TextDisabled($"({LuminaWrapper.GetZonePlaceName(record.ZoneID)})");
                 }
@@ -259,9 +327,17 @@ public unsafe class AutoCountPlayers : DailyModuleBase
         }
     }
 
-    private static void OnDraw()
+    #region 事件
+    
+    private static void OnZoneChanged
+    (
+        uint zone
+    ) =>
+        Throttler.Shared.Remove("AutoCountPlayers.Zone");
+
+    private void OnDraw()
     {
-        if (!ModuleConfig.DisplayLineWhenTargetingMe || PlayersManager.PlayersTargetingMe.Count == 0) return;
+        if (!config.DisplayLineWhenTargetingMe || PlayersManager.Instance().PlayersTargetingMe.Count == 0) return;
 
         if (!GameState.IsForeground) return;
 
@@ -278,7 +354,7 @@ public unsafe class AutoCountPlayers : DailyModuleBase
 
                 if (ImGui.Begin($"AutoCountPlayers-{localPlayer->EntityId}", WINDOW_FLAGS))
                 {
-                    ImGui.SetWindowPos(nodeState.Center - ImGui.GetWindowSize() * 0.75f);
+                    ImGui.SetWindowPos(nodeState.Center - (ImGui.GetWindowSize() * 0.75f));
 
                     using (FontManager.Instance().UIFont140.Push())
                     using (ImRaii.Group())
@@ -286,20 +362,21 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                         ImGuiHelpers.SeStringWrapped(new SeStringBuilder().AddIcon(BitmapFontIcon.Warning).Encode());
 
                         ImGui.SameLine();
-                        ImGui.SetCursorPosY(ImGui.GetCursorPosY() - 1.2f * GlobalFontScale);
-                        ImGuiOm.TextOutlined(KnownColor.Orange.ToVector4(), $"{PlayersManager.PlayersTargetingMe.Count}", KnownColor.SaddleBrown.ToVector4());
+                        ImGui.SetCursorPosY(ImGui.GetCursorPosY() - (1.2f * GlobalUIScale));
+                        ImGuiOm.TextOutlined
+                            (KnownColor.Orange.ToUInt(), $"{PlayersManager.Instance().PlayersTargetingMe.Count}", KnownColor.SaddleBrown.ToUInt());
 
                         if (GameState.ContentFinderCondition == 0)
                         {
                             using (FontManager.Instance().UIFont80.Push())
                             {
-                                var text = GetLoc("AutoCountPlayers-Notification-SomeoneTargetingMe");
+                                var text = Lang.Get("AutoCountPlayers-Notification-SomeoneTargetingMe");
                                 ImGuiOm.TextOutlined
                                 (
                                     ImGui.GetCursorScreenPos() - new Vector2(ImGui.CalcTextSize(text).X * 0.3f, 0),
-                                    KnownColor.Orange.ToVector4().ToUInt(),
+                                    KnownColor.Orange.ToUInt(),
                                     $"({text})",
-                                    KnownColor.SaddleBrown.ToVector4().ToUInt()
+                                    KnownColor.SaddleBrown.ToUInt()
                                 );
                             }
                         }
@@ -310,119 +387,192 @@ public unsafe class AutoCountPlayers : DailyModuleBase
             }
         }
 
-        var currentWindowSize = ImGui.GetMainViewport().Size;
-        if (!DService.Instance().GameGUI.WorldToScreen(localPlayer->Position, out var localScreenPos))
-            localScreenPos = currentWindowSize with { X = currentWindowSize.X / 2 };
+        var gameGUI  = DService.Instance().GameGUI;
+        var viewport = ImGui.GetMainViewport();
 
-        foreach (var playerInfo in PlayersManager.PlayersTargetingMe)
+        if (!gameGUI.WorldToScreen(localPlayer->Position, out var localScreenPos, out _))
+            localScreenPos = viewport.Pos + new Vector2(viewport.Size.X * 0.5f, viewport.Size.Y);
+
+        foreach (var playerInfo in PlayersManager.Instance().PlayersTargetingMe)
         {
-            if (DService.Instance().GameGUI.WorldToScreen(playerInfo.Player.Position, out var screenPos))
-                DrawLine(localScreenPos, screenPos, playerInfo.Player, LineColorRed, $" [{TimeSpan.FromSeconds(playerInfo.TargetingDurationSeconds)}]");
+            gameGUI.WorldToScreen(playerInfo.Player.Position, out var screenPos, out var isInView);
+
+            var linePositions = GetLinePositions
+            (
+                screenPos,
+                isInView,
+                viewport.Pos,
+                viewport.Size,
+                OFFSCREEN_MARKER_INSET * GlobalUIScale,
+                OFFSCREEN_LINE_OVERFLOW * GlobalUIScale
+            );
+
+            DrawLine
+            (
+                localScreenPos,
+                linePositions.LineEnd,
+                linePositions.Marker,
+                playerInfo.Player,
+                isInView,
+                true,
+                $" [{TimeSpan.FromSeconds(playerInfo.TargetingDurationSeconds)}]"
+            );
         }
     }
 
-    private static void OnZoneChanged(ushort obj)
+    private static void OnLogMessage
+    (
+        ref bool                isPrevented,
+        ref uint                logMessageID,
+        ref LogMessageQueueItem item
+    )
     {
-        FrameworkManager.Instance().Unreg(OnUpdate);
-
-        if (GameState.TerritoryIntendedUse != TerritoryIntendedUse.OccultCrescent ||
-            AgentModule.Instance()->GetAgentByInternalId(AgentId.ContentMemberList)->IsAgentActive())
-            return;
-
-        FrameworkManager.Instance().Reg(OnUpdate, 30_000);
+        if (logMessageID != 81) return;
+        isPrevented = true;
     }
 
-    private static void OnUpdate(IFramework framework)
+    private static void OnUpdate
+    (
+        IFramework framework
+    )
     {
-        if (GameState.TerritoryIntendedUse != TerritoryIntendedUse.OccultCrescent ||
-            AgentModule.Instance()->GetAgentByInternalId(AgentId.ContentMemberList)->IsAgentActive())
+        if (!IsPlayerSearchLocation) return;
+
+        if (!UIModule.IsScreenReady() ||
+            !Throttler.Shared.Throttle("AutoCountPlayers.Zone", 60_000))
+            return;
+        
+        if (IsContentSearchZone)
         {
-            FrameworkManager.Instance().Unreg(OnUpdate);
-            return;
+            if (InfoProxyContentMember.Instance() == null ||
+                AgentModule.Instance()->GetAgentByInternalId(AgentId.ContentMemberList)->IsAgentActive())
+                return;
+            
+            AgentId.ContentMemberList.SendEvent(0, 1);
         }
+        else if (IsPlayerSearchZone)
+        {
+            var searchInstance = InfoProxySearch.Instance();
+            if (searchInstance== null ||
+                AgentModule.Instance()->GetAgentByInternalId(AgentId.Search)->IsAgentActive())
+                return;
 
-        var proxy = (InfoProxy24*)InfoModule.Instance()->GetInfoProxyById((InfoProxyId)24);
-        if (proxy == null) return;
+            searchInstance->JobMask          = 0xFFFFFFFFFFFFFFFF; // all
+            searchInstance->LevelMin         = 1;
+            searchInstance->LevelMax         = 255;
+            searchInstance->GrandCompanyMask = 0xFF;
+            searchInstance->LanguageMask     = 0xFF;
+            searchInstance->OnlineStatusMask = 0x800000000000;
+            searchInstance->LocationIDs[0]   = (ushort)GameState.TerritoryTypeData.PlaceNameZone.RowId;
+            searchInstance->LocationCount    = 1;
+            for (var i = 0; i < searchInstance->Name.Length; i++)
+                searchInstance->Name[i] = 0;
 
-        AgentId.ContentMemberList.SendEvent(0, 1);
-    }
-
-    private void OnReceivePlayers(IReadOnlyList<IPlayerCharacter> characters)
-    {
-        if (Entry == null) return;
-
-        // 新月岛
-        if (GameState.TerritoryIntendedUse == TerritoryIntendedUse.OccultCrescent)
-            Entry.Shown = true;
+            searchInstance->RequestData();
+        }
         else
-            Entry.Shown = !DService.Instance().Condition[ConditionFlag.InCombat] || GameState.IsInPVPArea;
+            FrameworkManager.Instance().Unreg(OnUpdate);
+    }
 
-        if (!Entry.Shown)
+    private void OnReceivePlayers
+    (
+        IReadOnlyList<IPlayerCharacter> characters
+    )
+    {
+        if (entry == null) return;
+        
+        if (IsPlayerSearchLocation)
+            entry.Shown = true;
+        else
+            entry.Shown = !ICondition.Instance()[ConditionFlag.InCombat] || GameState.IsInPVPArea;
+
+        if (!entry.Shown)
         {
+            EnsureOverlay();
             Overlay.IsOpen = false;
             return;
         }
 
-        Entry.Text = $"{GetLoc("AutoCountPlayers-PlayersAroundCount")}: {PlayersManager.PlayersAroundCount}" +
-                     (PlayersManager.PlayersTargetingMe.Count == 0 ? string.Empty : $" ({PlayersManager.PlayersTargetingMe.Count})");
+        entry.Text = $"{Lang.Get("AutoCountPlayers-PlayersAroundCount")}: {PlayersManager.Instance().PlayersAroundCount}" +
+                     (PlayersManager.Instance().PlayersTargetingMe.Count == 0 ?
+                          string.Empty :
+                          $" ({PlayersManager.Instance().PlayersTargetingMe.Count})");
 
-        // 新月岛
-        if (GameState.TerritoryIntendedUse == TerritoryIntendedUse.OccultCrescent)
+        // 特殊场景探索
+        if (IsContentSearchZone)
         {
-            Entry.Text.Append
+            entry.Text.Append
             (
-                $" / {GetLoc("AutoCountPlayers-PlayersZoneCount")}: " +
-                $"{((InfoProxy24*)InfoModule.Instance()->GetInfoProxyById((InfoProxyId)24))->EntryCount}"
+                $" / {Lang.Get("AutoCountPlayers-PlayersZoneCount")}: " +
+                $"{InfoProxyContentMember.Instance()->EntryCount}"
+            );
+        }
+        else if (IsPlayerSearchZone)
+        {
+            var count = InfoProxySearch.Instance()->CharDataSpan
+                        .ToArray()
+                        .Count(x => x.Job > 0 && x.Location == GameState.TerritoryType);
+            entry.Text.Append
+            (
+                $" / {Lang.Get("AutoCountPlayers-PlayersZoneCount")}: " +
+                $"{count}"
             );
         }
 
         if (characters.Count == 0)
         {
-            Entry.Tooltip = string.Empty;
+            entry.Tooltip = string.Empty;
             return;
         }
 
         var tooltip = new SeStringBuilder();
 
-        if (PlayersManager.PlayersTargetingMe.Count > 0)
+        if (PlayersManager.Instance().PlayersTargetingMe.Count > 0)
         {
             tooltip.AddUiForeground(32)
-                   .AddText($"{GetLoc("AutoCountPlayers-PlayersTargetingMe")}")
+                   .AddText($"{Lang.Get("AutoCountPlayers-PlayersTargetingMe")}")
                    .AddUiForegroundOff()
                    .Add(NewLinePayload.Payload);
 
-            PlayersManager.PlayersTargetingMe.ForEach
+            PlayersManager.Instance().PlayersTargetingMe.ForEach
             (info =>
-                 tooltip.AddText($"{info.Player.Name} (")
-                        .AddIcon(info.Player.ClassJob.Value.ToBitmapFontIcon())
-                        .AddText($"{info.Player.ClassJob.Value.Name.ToString()})")
-                        .Add(NewLinePayload.Payload)
+                 tooltip
+                     .AddIcon(info.Player.ClassJob.Value.ToBitmapFontIcon())
+                     .AddText($"{info.Player.Name}")
+                     .AddIcon(BitmapFontIcon.CrossWorld)
+                     .AddText($"{info.Player.HomeWorld.Value.Name}")
+                     .Add(NewLinePayload.Payload)
             );
         }
 
         tooltip.AddUiForeground(32)
-               .AddText($"{GetLoc("AutoCountPlayers-PlayersAroundInfo")}")
+               .AddText($"{Lang.Get("AutoCountPlayers-PlayersAroundInfo")}")
                .AddUiForegroundOff()
                .Add(NewLinePayload.Payload);
 
         characters.ForEach
-        (info => tooltip.AddText($"{info.Name} (")
-                        .AddIcon(info.ClassJob.Value.ToBitmapFontIcon())
-                        .AddText($"{info.ClassJob.Value.Name.ToString()})")
-                        .Add(NewLinePayload.Payload)
+        (info => tooltip
+                 .AddIcon(info.ClassJob.Value.ToBitmapFontIcon())
+                 .AddText($"{info.Name}")
+                 .AddIcon(BitmapFontIcon.CrossWorld)
+                 .AddText($"{info.HomeWorld.Value.Name}")
+                 .Add(NewLinePayload.Payload)
         );
 
         var message = tooltip.Build();
         if (message.Payloads.Last() is NewLinePayload)
             message.Payloads.RemoveAt(message.Payloads.Count - 1);
 
-        Entry.Tooltip = message;
+        entry.Tooltip = message;
     }
 
-    private void OnPlayersTargetingMeUpdate(IReadOnlyList<PlayerTargetingInfo> targetingPlayersInfo)
+    private void OnPlayersTargetingMeUpdate
+    (
+        IReadOnlyList<PlayerTargetingInfo> targetingPlayersInfo
+    )
     {
-        var currentIds     = targetingPlayersInfo.Select(x => x.Player.EntityID).ToHashSet();
-        var endedTargeting = LastTargetingData.Where(x => !currentIds.Contains(x.Key)).ToList();
+        var currentIDs     = targetingPlayersInfo.Select(x => x.Player.EntityID).ToHashSet();
+        var endedTargeting = lastTargetingData.Where(x => !currentIDs.Contains(x.Key)).ToList();
 
         if (endedTargeting.Count > 0)
         {
@@ -430,11 +580,11 @@ public unsafe class AutoCountPlayers : DailyModuleBase
             {
                 var duration = DateTime.Now - info.TargetingStartTime;
 
-                ModuleConfig.TargetingHistories.Add
+                config.TargetingHistories.Add
                 (
                     new()
                     {
-                        Name        = info.Player.Name.ToString(),
+                        Name        = info.Player.Name,
                         HomeWorldID = info.Player.HomeWorld.RowId,
                         JobID       = info.Player.ClassJob.RowId,
                         StartTime   = info.TargetingStartTime,
@@ -443,46 +593,50 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                     }
                 );
 
-                LastTargetingData.Remove(key);
+                lastTargetingData.Remove(key);
             }
-            
-            if (ModuleConfig.TargetingHistories.Count > 100)
-                ModuleConfig.TargetingHistories.RemoveRange(0, ModuleConfig.TargetingHistories.Count - 100);
-            
-            ModuleConfig.Save(this);
+
+            if (config.TargetingHistories.Count > 100)
+                config.TargetingHistories.RemoveRange(0, config.TargetingHistories.Count - 100);
+
+            config.Save(this);
         }
 
         foreach (var info in targetingPlayersInfo)
-            LastTargetingData[info.Player.EntityID] = info;
-        
+        {
+            if (info.Player.ClassJob.RowId == 0) continue;
+            lastTargetingData[info.Player.EntityID] = info;
+        }
+
         if (targetingPlayersInfo.Count > 0 &&
             (GameState.ContentFinderCondition == 0 || DService.Instance().PartyList.Length < 2))
         {
             var newTargetingPlayers = targetingPlayersInfo.Where(info => info.IsNew).ToList();
-            if (newTargetingPlayers.Any(info => Throttler.Throttle($"AutoCountPlayers-Player-{info.Player.EntityID}", 30_000)))
+
+            if (newTargetingPlayers.Any(info => Throttler.Shared.Throttle($"AutoCountPlayers-Player-{info.Player.EntityID}", 30_000)))
             {
-                if (ModuleConfig.SendTTS)
+                if (config.SendTTS)
                 {
-                    if (!ModuleConfig.FilterFriend || targetingPlayersInfo.All(x => !x.Player.ToStruct()->IsFriend))
-                        Speak(GetLoc("AutoCountPlayers-Notification-SomeoneTargetingMe"));
+                    if (!config.FilterFriend || targetingPlayersInfo.All(x => !x.Player.ToStruct()->IsFriend))
+                        NotifyHelper.Speak(Lang.Get("AutoCountPlayers-Notification-SomeoneTargetingMe"));
                 }
 
-                if (ModuleConfig.SendNotification)
+                if (config.SendNotification)
                 {
-                    if (!ModuleConfig.FilterFriend || targetingPlayersInfo.All(x => !x.Player.ToStruct()->IsFriend))
-                        NotificationWarning(GetLoc("AutoCountPlayers-Notification-SomeoneTargetingMe"));
+                    if (!config.FilterFriend || targetingPlayersInfo.All(x => !x.Player.ToStruct()->IsFriend))
+                        NotifyHelper.Instance().NotificationWarning(Lang.Get("AutoCountPlayers-Notification-SomeoneTargetingMe"));
                 }
-                
-                if (ModuleConfig.SendChat)
+
+                if (config.SendChat)
                 {
                     var builder = new SeStringBuilder();
 
-                    builder.Append($"{GetLoc("AutoCountPlayers-Notification-SomeoneTargetingMe")}:");
+                    builder.Append($"{Lang.Get("AutoCountPlayers-Notification-SomeoneTargetingMe")}:");
                     builder.Add(new NewLinePayload());
 
                     foreach (var info in targetingPlayersInfo)
                     {
-                        builder.Add(new PlayerPayload(info.Player.Name.ToString(), info.Player.HomeWorld.RowId))
+                        builder.Add(new PlayerPayload(info.Player.Name, info.Player.HomeWorld.RowId))
                                .Append(" (")
                                .AddIcon(info.Player.ClassJob.Value.ToBitmapFontIcon())
                                .Append($" {info.Player.ClassJob.Value.Name})");
@@ -493,37 +647,79 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                     if (message.Payloads.Last() is NewLinePayload)
                         message.Payloads.RemoveAt(message.Payloads.Count - 1);
 
-                    Chat(builder.Build());
+                    // TODO: 改成 ReadOnlyString
+                    NotifyHelper.Instance().Chat(builder.Build().Encode());
                 }
             }
         }
     }
 
-    private void InfoProxy24EndRequestDetour(InfoProxy24* proxy)
+    private void InfoProxyContentMemberRequestDetour
+    (
+        InfoProxyContentMember* proxy
+    )
     {
-        InfoProxy24EndRequestHook.Original(proxy);
-        OnReceivePlayers(PlayersManager.PlayersAround);
+        InfoProxyContentMemberEndRequestHook.Original(proxy);
+        OnReceivePlayers(PlayersManager.Instance().PlayersAround);
+    }
+    
+    private void InfoProxySearchRequestDetour
+    (
+        InfoProxySearch* proxy
+    )
+    {
+        InfoProxySearchEndRequestHook.Original(proxy);
+        OnReceivePlayers(PlayersManager.Instance().PlayersAround);
     }
 
-    private static void DrawLine(Vector2 startPos, Vector2 endPos, ICharacter chara, uint lineColor = 0, string? extraInfo = null)
+    #endregion
+
+    private void DrawLine
+    (
+        Vector2    startPos,
+        Vector2    lineEndPos,
+        Vector2    markerPos,
+        ICharacter chara,
+        bool       isMarkerVisible,
+        bool       isAlert = false,
+        string?    extraInfo = null
+    )
     {
-        lineColor = lineColor == 0 ? LineColorBlue : lineColor;
+        var drawList     = ImGui.GetForegroundDrawList();
+        var lineColor    = isAlert ? AlertLineColor : InfoLineColor;
+        var labelColor   = isAlert ? AlertLabelColor : InfoLabelColor;
+        var startRadius  = START_MARKER_RADIUS * GlobalUIScale;
+        var markerRadius = TARGET_MARKER_RADIUS * GlobalUIScale;
 
-        var drawList = ImGui.GetForegroundDrawList();
+        drawList.AddLine(startPos, lineEndPos, LineOutlineColor, LINE_OUTLINE_THICKNESS * GlobalUIScale);
+        drawList.AddLine(startPos, lineEndPos, lineColor, LINE_THICKNESS * GlobalUIScale);
 
-        drawList.AddLine(startPos, endPos, lineColor, 8f);
-        drawList.AddCircleFilled(startPos, 12f, DotColor);
-        drawList.AddCircleFilled(endPos,   12f, DotColor);
+        drawList.AddCircleFilled(startPos, startRadius + (START_MARKER_OUTLINE_SIZE * GlobalUIScale), LineOutlineColor);
+        drawList.AddCircleFilled(startPos, startRadius, lineColor);
 
-        ImGui.SetNextWindowPos(endPos);
+        if (isMarkerVisible)
+        {
+            drawList.AddCircleFilled(markerPos, markerRadius + (TARGET_MARKER_OUTLINE_SIZE * GlobalUIScale), LineOutlineColor);
+            drawList.AddCircle(markerPos, markerRadius, lineColor, TARGET_MARKER_SEGMENTS, TARGET_MARKER_THICKNESS * GlobalUIScale);
+            drawList.AddCircleFilled(markerPos, TARGET_MARKER_CORE_RADIUS * GlobalUIScale, MarkerCoreColor);
+        }
+
+        var viewportCenter = ImGui.GetMainViewport().GetCenter();
+        var labelPivot = new Vector2
+        (
+            markerPos.X >= viewportCenter.X ? 1f : 0f,
+            markerPos.Y >= viewportCenter.Y ? 1f : 0f
+        );
+
+        ImGui.SetNextWindowPos(markerPos, ImGuiCond.Always, labelPivot);
 
         if (ImGui.Begin($"AutoCountPlayers-{chara.EntityID}", WINDOW_FLAGS))
         {
             using (ImRaii.Group())
             {
-                ScaledDummy(12f);
+                ImGuiOm.ScaledDummy(12f);
 
-                var icon = JobIcons.GetOrAdd
+                var icon = jobIcons.GetOrAdd
                 (
                     chara.ClassJob.RowId,
                     _ => new SeStringBuilder().AddIcon(chara.ClassJob.Value.ToBitmapFontIcon()).Encode()
@@ -532,24 +728,67 @@ public unsafe class AutoCountPlayers : DailyModuleBase
                 ImGuiHelpers.SeStringWrapped(icon);
 
                 ImGui.SameLine();
-                ImGuiOm.TextOutlined(KnownColor.Orange.ToVector4(), $"{chara.Name}" + (extraInfo ?? string.Empty));
+                ImGuiOm.TextOutlined(labelColor, $"{chara.Name}" + (extraInfo ?? string.Empty));
             }
 
             ImGui.End();
         }
     }
 
-    private class Config : ModuleConfiguration
+    private static (Vector2 LineEnd, Vector2 Marker) GetLinePositions
+    (
+        Vector2 projectedPosition,
+        bool    isInView,
+        Vector2 viewportPosition,
+        Vector2 viewportSize,
+        float   markerInset,
+        float   lineOverflow
+    )
     {
-        public float ScaleFactor                = 1;
+        if (isInView) return (projectedPosition, projectedPosition);
 
+        var viewportCenter = viewportPosition + (viewportSize * 0.5f);
+        var direction      = projectedPosition - viewportCenter;
+
+        if (!float.IsFinite(direction.X) ||
+            !float.IsFinite(direction.Y) ||
+            direction.LengthSquared() < MIN_DIRECTION_LENGTH_SQUARED)
+            direction = Vector2.UnitY;
+
+        var halfWidth           = Math.Max(viewportSize.X * 0.5f, 1f);
+        var halfHeight          = Math.Max(viewportSize.Y * 0.5f, 1f);
+        var horizontalT         = MathF.Abs(direction.X) > float.Epsilon ? halfWidth / MathF.Abs(direction.X) : float.MaxValue;
+        var verticalT           = MathF.Abs(direction.Y) > float.Epsilon ? halfHeight / MathF.Abs(direction.Y) : float.MaxValue;
+        var edgePosition        = viewportCenter + (direction * MathF.Min(horizontalT, verticalT));
+        var normalizedDirection = Vector2.Normalize(direction);
+
+        return
+        (
+            edgePosition + (normalizedDirection * lineOverflow),
+            edgePosition - (normalizedDirection * markerInset)
+        );
+    }
+
+    private void EnsureOverlay()
+    {
+        if (Overlay != null) return;
+
+        Overlay            =  new(this);
+        Overlay.Flags      &= ~ImGuiWindowFlags.NoTitleBar;
+        Overlay.Flags      &= ~ImGuiWindowFlags.AlwaysAutoResize;
+        Overlay.WindowName =  $"{Lang.Get("AutoCountPlayers-PlayersAroundInfo")}###AutoCountPlayers-Overlay";
+    }
+
+    private class Config : ModuleConfig
+    {
         public bool DisplayLineWhenTargetingMe = true;
+
+        public bool  FilterFriend;
+        public float ScaleFactor = 1;
 
         public bool SendChat         = true;
         public bool SendNotification = true;
         public bool SendTTS          = true;
-
-        public bool FilterFriend;
 
         public List<TargetingRecord> TargetingHistories = [];
     }
@@ -563,4 +802,68 @@ public unsafe class AutoCountPlayers : DailyModuleBase
         public DateTime StartTime   { get; set; }
         public TimeSpan Duration    { get; set; }
     }
+
+    #region 常量
+
+    private const ImGuiWindowFlags WINDOW_FLAGS =
+        ImGuiWindowFlags.NoScrollbar           |
+        ImGuiWindowFlags.AlwaysAutoResize      |
+        ImGuiWindowFlags.NoTitleBar            |
+        ImGuiWindowFlags.NoBackground          |
+        ImGuiWindowFlags.NoBringToFrontOnFocus |
+        ImGuiWindowFlags.NoFocusOnAppearing    |
+        ImGuiWindowFlags.NoNavFocus            |
+        ImGuiWindowFlags.NoDocking             |
+        ImGuiWindowFlags.NoMove                |
+        ImGuiWindowFlags.NoResize              |
+        ImGuiWindowFlags.NoScrollWithMouse     |
+        ImGuiWindowFlags.NoInputs              |
+        ImGuiWindowFlags.NoSavedSettings;
+
+    private const float LINE_THICKNESS               = 3f;
+    private const float LINE_OUTLINE_THICKNESS       = 5f;
+    private const float START_MARKER_RADIUS          = 2.25f;
+    private const float START_MARKER_OUTLINE_SIZE    = 1.25f;
+    private const float TARGET_MARKER_RADIUS         = 4f;
+    private const float TARGET_MARKER_OUTLINE_SIZE   = 1.5f;
+    private const float TARGET_MARKER_THICKNESS      = 1.5f;
+    private const float TARGET_MARKER_CORE_RADIUS    = 1.25f;
+    private const int   TARGET_MARKER_SEGMENTS       = 16;
+    private const float OFFSCREEN_MARKER_INSET       = 14f;
+    private const float OFFSCREEN_LINE_OVERFLOW      = 32f;
+    private const float MIN_DIRECTION_LENGTH_SQUARED = 0.001f;
+
+    private const float INFO_LINE_OPACITY    = 0.78f;
+    private const float ALERT_LINE_OPACITY   = 0.88f;
+    private const float INFO_LABEL_OPACITY   = 0.96f;
+    private const float ALERT_LABEL_OPACITY  = 0.98f;
+    private const float LINE_OUTLINE_OPACITY = 0.4f;
+    private const float MARKER_CORE_OPACITY  = 0.88f;
+
+    private static readonly uint InfoLineColor =
+        (KnownColor.DeepSkyBlue.ToVector4() with { W = INFO_LINE_OPACITY }).ToUInt();
+
+    private static readonly uint AlertLineColor =
+        (KnownColor.IndianRed.ToVector4() with { W = ALERT_LINE_OPACITY }).ToUInt();
+
+    private static readonly uint InfoLabelColor =
+        (KnownColor.LightSkyBlue.ToVector4() with { W = INFO_LABEL_OPACITY }).ToUInt();
+
+    private static readonly uint AlertLabelColor =
+        (KnownColor.LightCoral.ToVector4() with { W = ALERT_LABEL_OPACITY }).ToUInt();
+
+    private static readonly uint LineOutlineColor =
+        (KnownColor.Black.ToVector4() with { W = LINE_OUTLINE_OPACITY }).ToUInt();
+
+    private static readonly uint MarkerCoreColor =
+        (KnownColor.WhiteSmoke.ToVector4() with { W = MARKER_CORE_OPACITY }).ToUInt();
+
+    private static readonly FrozenSet<TerritoryIntendedUse> ContentMemberListValidZones =
+    [
+        TerritoryIntendedUse.OccultCrescent,
+        TerritoryIntendedUse.Bozja,
+        TerritoryIntendedUse.Eureka
+    ];
+
+    #endregion
 }

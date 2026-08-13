@@ -1,25 +1,25 @@
-using System;
-using System.Collections.Generic;
-using DailyRoutines.Abstracts;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
-using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
-using FFXIVClientStructs.FFXIV.Component.GUI;
+using OmenTools.Interop.Game.AddonEvent;
+using OmenTools.OmenService;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class AutoMiniCactpot : DailyModuleBase
+public unsafe class AutoMiniCactpot : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoMiniCactpotTitle"),
-        Description = GetLoc("AutoMiniCactpotDescription"),
-        Category    = ModuleCategories.GoldSaucer
+        Title       = Lang.Get("AutoMiniCactpotTitle"),
+        Description = Lang.Get("AutoMiniCactpotDescription"),
+        Category    = ModuleCategory.GoldSaucer
     };
 
-    private static readonly MiniCactpotSolver Solver = new();
+    private readonly MiniCactpotSolver solver = new();
 
     protected override void Init()
     {
@@ -30,14 +30,18 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
         if (LotteryDaily != null)
             OnAddon(AddonEvent.PostSetup, null);
     }
-    
+
     protected override void Uninit()
     {
         DService.Instance().AddonLifecycle.UnregisterListener(OnAddon);
         FrameworkManager.Instance().Unreg(OnUpdate);
     }
 
-    private void OnAddon(AddonEvent type, AddonArgs args)
+    private void OnAddon
+    (
+        AddonEvent type,
+        AddonArgs  args
+    )
     {
         switch (type)
         {
@@ -47,19 +51,22 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 break;
             case AddonEvent.PreFinalize:
                 FrameworkManager.Instance().Unreg(OnUpdate);
-                TaskHelper.Enqueue(() => ClickSelectYesnoYes());
+                TaskHelper.Enqueue(() => AddonSelectYesnoEvent.ClickYes());
                 break;
         }
     }
 
-    private static void OnUpdate(IFramework framework)
+    private void OnUpdate
+    (
+        IFramework framework
+    )
     {
         var addon = (AddonLotteryDaily*)LotteryDaily;
         var agent = AgentLotteryDaily.Instance();
         if (addon == null || agent == null) return;
 
         Span<byte> state = stackalloc byte[MiniCactpotSolver.TOTAL_NUMBERS];
-        for (var i = 0; i < MiniCactpotSolver.TOTAL_NUMBERS; i++) 
+        for (var i = 0; i < MiniCactpotSolver.TOTAL_NUMBERS; i++)
             state[i] = agent->Numbers[i];
 
         switch (agent->Status)
@@ -67,34 +74,34 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
             // 选数字
             case 1:
             {
-                var solution = Solver.Solve(state);
+                var solution = solver.Solve(state);
+
                 for (var i = 0; i < MiniCactpotSolver.TOTAL_NUMBERS; i++)
-                {
                     if (solution[i])
                     {
                         ClickGameNode(addon, i);
                         break;
                     }
-                }
+
                 break;
             }
 
             // 选线
             case 2:
             {
-                var solution = Solver.Solve(state);
-                ReadOnlySpan<int> map = [6, 3, 4, 5, 7, 0, 1, 2];
+                var               solution = solver.Solve(state);
+                ReadOnlySpan<int> map      = [6, 3, 4, 5, 7, 0, 1, 2];
+
                 for (var i = 0; i < MiniCactpotSolver.TOTAL_LANES; i++)
-                {
                     if (solution[map[i]])
                     {
                         ClickLaneNode(addon, i);
                         break;
                     }
-                }
+
                 break;
             }
-            
+
             // 结束
             case 4:
                 addon->AtkUnitBase.Callback(-1);
@@ -103,15 +110,23 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
         }
     }
 
-    private static void ClickGameNode(AddonLotteryDaily* addon, int i)
+    private static void ClickGameNode
+    (
+        AddonLotteryDaily* addon,
+        int                i
+    )
     {
         var nodeID = addon->GameBoard[i]->AtkComponentButton.AtkComponentBase.OwnerNode->AtkResNode.NodeId;
         if (nodeID is < 30 or > 38) return;
-        
+
         addon->AtkUnitBase.Callback(1, (int)(nodeID - 30));
     }
 
-    private static void ClickLaneNode(AddonLotteryDaily* addon, int i)
+    private static void ClickLaneNode
+    (
+        AddonLotteryDaily* addon,
+        int                i
+    )
     {
         if (i is < 0 or > 8) return;
 
@@ -119,7 +134,7 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
         if (nodeID is < 21 or > 28) return;
 
         var unkNumber3D4 = (int)(nodeID - 21);
-        
+
         var ptr = (int*)((nint)addon + 1004);
         *ptr = unkNumber3D4;
 
@@ -146,7 +161,10 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
 
         private readonly Dictionary<ulong, float> memo = new();
 
-        public bool[] Solve(ReadOnlySpan<byte> state)
+        public bool[] Solve
+        (
+            ReadOnlySpan<byte> state
+        )
         {
             ulong board         = 0;
             var   revealedCount = 0;
@@ -169,15 +187,14 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 Span<byte> available = stackalloc byte[9];
                 var        avCount   = 0;
                 for (var i = 1; i <= 9; i++)
-                {
                     if ((usedMask & (1 << (i - 1))) == 0)
                         available[avCount++] = (byte)i;
-                }
                 var availableSpan = available[..avCount];
 
                 for (var i = 0; i < 8; i++)
                 {
                     var ev = CalculateLineEV(board, i, availableSpan);
+
                     if (ev > maxEv + 0.001)
                     {
                         maxEv = ev;
@@ -201,13 +218,14 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                     if (((board >> (i * 4)) & 0xF) != 0) continue;
 
                     var ev = EvaluateCell(board, usedMask, revealedCount, i);
+
                     if (ev > maxEv + 0.001)
                     {
                         maxEv = ev;
                         Array.Clear(result, 0, result.Length);
                         result[i] = true;
                     }
-                    else if (Math.Abs(ev - maxEv) < 0.001) 
+                    else if (Math.Abs(ev - maxEv) < 0.001)
                         result[i] = true;
                 }
 
@@ -215,7 +233,12 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
             }
         }
 
-        private float GetMaxEV(ulong board, int usedMask, int revealedCount)
+        private float GetMaxEV
+        (
+            ulong board,
+            int   usedMask,
+            int   revealedCount
+        )
         {
             if (revealedCount == 4)
             {
@@ -225,17 +248,15 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 Span<byte> available = stackalloc byte[9];
                 var        avCount   = 0;
                 for (var i = 1; i <= 9; i++)
-                {
                     if ((usedMask & (1 << (i - 1))) == 0)
                         available[avCount++] = (byte)i;
-                }
 
                 var availableSpan = available[..avCount];
 
                 for (var i = 0; i < 8; i++)
                 {
                     var ev = CalculateLineEV(board, i, availableSpan);
-                    if (ev > maxLineEv) 
+                    if (ev > maxLineEv)
                         maxLineEv = ev;
                 }
 
@@ -247,12 +268,13 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 if (memo.TryGetValue(board, out var val)) return val;
 
                 var maxCellEv = 0f;
+
                 for (var i = 0; i < 9; i++)
                 {
                     if (((board >> (i * 4)) & 0xF) != 0) continue;
 
                     var ev = EvaluateCell(board, usedMask, revealedCount, i);
-                    if (ev > maxCellEv) 
+                    if (ev > maxCellEv)
                         maxCellEv = ev;
                 }
 
@@ -261,7 +283,13 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
             }
         }
 
-        private float EvaluateCell(ulong board, int usedMask, int revealedCount, int cellIndex)
+        private float EvaluateCell
+        (
+            ulong board,
+            int   usedMask,
+            int   revealedCount,
+            int   cellIndex
+        )
         {
             var sumEv         = 0f;
             var count         = 0;
@@ -276,10 +304,17 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 count++;
             }
 
-            return count == 0 ? 0 : sumEv / count;
+            return count == 0 ?
+                       0 :
+                       sumEv / count;
         }
 
-        private static float CalculateLineEV(ulong board, int lineIdx, ReadOnlySpan<byte> available)
+        private static float CalculateLineEV
+        (
+            ulong              board,
+            int                lineIdx,
+            ReadOnlySpan<byte> available
+        )
         {
             var lineIndices = Lines[lineIdx];
             var currentSum  = 0;
@@ -315,13 +350,11 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 case 2:
                 {
                     for (var i = 0; i < available.Length; i++)
+                    for (var j = 0; j < available.Length; j++)
                     {
-                        for (var j = 0; j < available.Length; j++)
-                        {
-                            if (i == j) continue;
-                            totalPayout += Payouts[currentSum + available[i] + available[j]];
-                            perms++;
-                        }
+                        if (i == j) continue;
+                        totalPayout += Payouts[currentSum + available[i] + available[j]];
+                        perms++;
                     }
 
                     break;
@@ -329,16 +362,15 @@ public unsafe class AutoMiniCactpot : DailyModuleBase
                 default:
                 {
                     for (var i = 0; i < available.Length; i++)
+                    for (var j = 0; j < available.Length; j++)
                     {
-                        for (var j = 0; j < available.Length; j++)
+                        if (i == j) continue;
+
+                        for (var k = 0; k < available.Length; k++)
                         {
-                            if (i == j) continue;
-                            for (var k = 0; k < available.Length; k++)
-                            {
-                                if (k == i || k == j) continue;
-                                totalPayout += Payouts[currentSum + available[i] + available[j] + available[k]];
-                                perms++;
-                            }
+                            if (k == i || k == j) continue;
+                            totalPayout += Payouts[currentSum + available[i] + available[j] + available[k]];
+                            perms++;
                         }
                     }
 

@@ -1,60 +1,54 @@
-using System;
 using System.Collections.Frozen;
-using System.Collections.Generic;
 using System.Numerics;
-using System.Threading;
-using System.Threading.Tasks;
-using DailyRoutines.Abstracts;
-using DailyRoutines.Helpers;
-using DailyRoutines.Managers;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Gui.Dtr;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Interface.Utility;
-using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
-using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Newtonsoft.Json;
+using OmenTools.Dalamud;
+using OmenTools.Interop.Game.Lumina;
+using OmenTools.OmenService;
+using OmenTools.Threading;
+using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 using LuminaStatus = Lumina.Excel.Sheets.Status;
 using GameBattleChara = FFXIVClientStructs.FFXIV.Client.Game.Character.BattleChara;
 
 namespace DailyRoutines.ModulesPublic;
 
-public class AutoDisplayMitigationInfo : DailyModuleBase
+public class AutoDisplayMitigationInfo : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoDisplayMitigationInfoTitle"),
-        Description = GetLoc("AutoDisplayMitigationInfoDescription"),
-        Category    = ModuleCategories.Combat,
+        Title       = Lang.Get("AutoDisplayMitigationInfoTitle"),
+        Description = Lang.Get("AutoDisplayMitigationInfoDescription"),
+        Category    = ModuleCategory.Combat,
         Author      = ["HaKu"]
     };
 
     public override ModulePermission Permission { get; } = new() { AllDefaultEnabled = true };
 
-    private static readonly byte[] DamagePhysicalStr = new SeString(new IconPayload(BitmapFontIcon.DamagePhysical)).Encode();
-    private static readonly byte[] DamageMagicalStr  = new SeString(new IconPayload(BitmapFontIcon.DamageMagical)).Encode();
+    private          Config          config = null!;
+    private          IDtrBarEntry?   barEntry;
+    private readonly MitigationState state = new();
 
-    private static Config                   ModuleConfig = null!;
-    private static CancellationTokenSource? RemoteFetchCancelSource;
-    private static IDtrBarEntry?            BarEntry;
+    private readonly CancellationTokenSource? remoteFetchCancelSource = new();
 
-    private static readonly MitigationState State = new();
-
-    private static bool IsCombatEventsRegistered;
-    private static bool IsNeedToDrawOnPartyList;
+    private bool isCombatEventsRegistered;
+    private bool isNeedToDrawOnPartyList;
 
     protected override void Init()
     {
-        ModuleConfig = LoadConfig<Config>() ?? new Config();
+        config = Config.Load(this) ?? new();
 
-        SetOverlay();
-
-        RemoteFetchCancelSource = new();
-        _                       = RemoteRepoManager.FetchMitigationStatusesAsync(RemoteFetchCancelSource.Token);
+        _ = RemoteRepoManager.FetchMitigationStatusesAsync(remoteFetchCancelSource.Token);
 
         DService.Instance().ClientState.TerritoryChanged += OnZoneChanged;
         DService.Instance().Condition.ConditionChange    += OnConditionChanged;
@@ -72,21 +66,20 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
         UnregCombatEvents();
 
-        BarEntry?.Remove();
-        BarEntry = null;
+        barEntry?.Remove();
+        barEntry = null;
 
-        RemoteFetchCancelSource?.Cancel();
-        RemoteFetchCancelSource?.Dispose();
-        RemoteFetchCancelSource = null;
+        remoteFetchCancelSource?.Cancel();
+        remoteFetchCancelSource?.Dispose();
     }
 
     protected override void ConfigUI()
     {
-        if (ImGui.Checkbox(GetLoc("TransparentOverlay"), ref ModuleConfig.TransparentOverlay))
+        if (ImGui.Checkbox(Lang.Get("TransparentOverlay"), ref config.TransparentOverlay))
         {
-            SaveConfig(ModuleConfig);
+            config.Save(this);
 
-            if (ModuleConfig.TransparentOverlay)
+            if (config.TransparentOverlay)
             {
                 Overlay.Flags |= ImGuiWindowFlags.NoBackground;
                 Overlay.Flags |= ImGuiWindowFlags.NoTitleBar;
@@ -98,21 +91,21 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             }
         }
 
-        if (ImGui.Checkbox(GetLoc("ResizeableOverlay"), ref ModuleConfig.ResizeableOverlay))
+        if (ImGui.Checkbox(Lang.Get("ResizeableOverlay"), ref config.ResizeableOverlay))
         {
-            SaveConfig(ModuleConfig);
+            config.Save(this);
 
-            if (ModuleConfig.ResizeableOverlay)
+            if (config.ResizeableOverlay)
                 Overlay.Flags &= ~ImGuiWindowFlags.NoResize;
             else
                 Overlay.Flags |= ImGuiWindowFlags.NoResize;
         }
 
-        if (ImGui.Checkbox(GetLoc("MoveableOverlay"), ref ModuleConfig.MoveableOverlay))
+        if (ImGui.Checkbox(Lang.Get("MoveableOverlay"), ref config.MoveableOverlay))
         {
-            SaveConfig(ModuleConfig);
+            config.Save(this);
 
-            if (!ModuleConfig.MoveableOverlay)
+            if (!config.MoveableOverlay)
             {
                 Overlay.Flags |= ImGuiWindowFlags.NoMove;
                 Overlay.Flags |= ImGuiWindowFlags.NoInputs;
@@ -127,10 +120,10 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
     protected override void OverlayUI()
     {
-        if (State.IsLocalEmpty)
+        if (state.IsLocalEmpty)
             return;
 
-        ImGuiHelpers.SeStringWrapped(BarEntry?.Text?.Encode() ?? []);
+        ImGuiHelpers.SeStringWrapped(barEntry?.Text?.Encode() ?? []);
 
         ImGui.Separator();
 
@@ -138,22 +131,22 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         if (!table)
             return;
 
-        ImGui.TableSetupColumn("Icon",  ImGuiTableColumnFlags.WidthFixed,   24f * GlobalFontScale);
+        ImGui.TableSetupColumn("Icon",  ImGuiTableColumnFlags.WidthFixed,   24f * GlobalUIScale);
         ImGui.TableSetupColumn("Name",  ImGuiTableColumnFlags.WidthStretch, 20);
         ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch, 20);
 
         if (!DService.Instance().Texture.TryGetFromGameIcon(new(210405), out var barrierIcon))
             return;
 
-        foreach (var status in State.LocalActiveStatus)
+        foreach (var status in state.LocalActiveStatus)
             DrawStatusRow(status);
 
-        foreach (var status in State.TargetActiveStatus)
+        foreach (var status in state.TargetActiveStatus)
             DrawStatusRow(status);
 
-        if (State.LocalShield > 0)
+        if (state.LocalShield > 0)
         {
-            if (!State.IsLocalEmpty)
+            if (!state.IsLocalEmpty)
                 ImGui.TableNextRow();
 
             ImGui.TableNextRow();
@@ -162,21 +155,21 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
             ImGui.TableNextColumn();
             ImGui.AlignTextToFramePadding();
-            ImGui.TextUnformatted($"{GetLoc("Shield")}");
+            ImGui.TextUnformatted($"{Lang.Get("Shield")}");
 
             ImGui.TableNextColumn();
-            ImGui.TextUnformatted($"{State.LocalShield}");
+            ImGui.TextUnformatted($"{state.LocalShield}");
         }
     }
 
     private void SetOverlay()
     {
         Overlay            ??= new(this);
-        Overlay.WindowName =   GetLoc("AutoDisplayMitigationInfoTitle");
+        Overlay.WindowName =   Lang.Get("AutoDisplayMitigationInfoTitle");
         Overlay.Flags      &=  ~ImGuiWindowFlags.NoTitleBar;
         Overlay.Flags      &=  ~ImGuiWindowFlags.AlwaysAutoResize;
 
-        if (ModuleConfig.TransparentOverlay)
+        if (config.TransparentOverlay)
         {
             Overlay.Flags |= ImGuiWindowFlags.NoBackground;
             Overlay.Flags |= ImGuiWindowFlags.NoTitleBar;
@@ -187,12 +180,12 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             Overlay.Flags &= ~ImGuiWindowFlags.NoTitleBar;
         }
 
-        if (ModuleConfig.ResizeableOverlay)
+        if (config.ResizeableOverlay)
             Overlay.Flags &= ~ImGuiWindowFlags.NoResize;
         else
             Overlay.Flags |= ImGuiWindowFlags.NoResize;
 
-        if (!ModuleConfig.MoveableOverlay)
+        if (!config.MoveableOverlay)
         {
             Overlay.Flags |= ImGuiWindowFlags.NoMove;
             Overlay.Flags |= ImGuiWindowFlags.NoInputs;
@@ -204,7 +197,10 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         }
     }
 
-    private static void DrawStatusRow(ActiveMitigation status)
+    private static void DrawStatusRow
+    (
+        ActiveMitigation status
+    )
     {
         if (!LuminaGetter.TryGetRow<LuminaStatus>(status.StatusID, out var row))
             return;
@@ -222,21 +218,153 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         ImGuiOm.TooltipHover($"{status.StatusID}");
 
         ImGui.TableNextColumn();
-        ImGuiHelpers.SeStringWrapped(DamagePhysicalStr);
+        ImGuiHelpers.SeStringWrapped(DamagePhysicalString);
 
         ImGui.SameLine();
         ImGui.TextUnformatted($"{status.Physical}% ");
 
         ImGui.SameLine();
-        ImGuiHelpers.SeStringWrapped(DamageMagicalStr);
+        ImGuiHelpers.SeStringWrapped(DamageMagicalString);
 
         ImGui.SameLine();
         ImGui.TextUnformatted($"{status.Magical}% ");
     }
 
+    private void RegCombatEvents()
+    {
+        if (isCombatEventsRegistered)
+            return;
+
+        WindowManager.Instance().PostDraw += Draw;
+        FrameworkManager.Instance().Reg(OnUpdate, 500);
+
+        barEntry ??= DService.Instance().DTRBar.Get("DailyRoutines-AutoDisplayMitigationInfo");
+        barEntry.OnClick = _ =>
+        {
+            if (Overlay == null)
+                SetOverlay();
+
+            Overlay.IsOpen ^= true;
+        };
+
+        isCombatEventsRegistered = true;
+    }
+
+    private void UnregCombatEvents()
+    {
+        if (!isCombatEventsRegistered)
+            return;
+
+        WindowManager.Instance().PostDraw -= Draw;
+        FrameworkManager.Instance().Unreg(OnUpdate);
+        state.Clear();
+
+        if (barEntry != null)
+        {
+            barEntry.Shown   = false;
+            barEntry.Tooltip = null;
+            barEntry.Text    = null;
+        }
+
+        isCombatEventsRegistered = false;
+    }
+
+    private void UpdateStatusBar()
+    {
+        if (barEntry == null)
+            return;
+
+        if (state.IsLocalEmpty)
+        {
+            barEntry.Shown   = false;
+            barEntry.Tooltip = null;
+            barEntry.Text    = null;
+            return;
+        }
+
+        var textBuilder  = new SeStringBuilder();
+        var firstBarItem = true;
+
+        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.DamagePhysical, state.LocalPhysical, true);
+        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.DamageMagical,  state.LocalMagical,  true);
+        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.Tank,           state.LocalShield,   false);
+
+        barEntry.Text = textBuilder.Build();
+
+        var tipBuilder   = new SeStringBuilder();
+        var firstTipItem = true;
+
+        foreach (var status in state.LocalActiveStatus)
+        {
+            if (!firstTipItem)
+                tipBuilder.Append("\n");
+            tipBuilder.Append($"{LuminaWrapper.GetStatusName(status.StatusID)}:");
+            tipBuilder.AddIcon(BitmapFontIcon.DamagePhysical);
+            tipBuilder.Append($"{status.Physical}% ");
+            tipBuilder.AddIcon(BitmapFontIcon.DamageMagical);
+            tipBuilder.Append($"{status.Magical}% ");
+            firstTipItem = false;
+        }
+
+        if (state.LocalShield > 0)
+        {
+            if (!firstTipItem)
+                tipBuilder.Append("\n");
+            tipBuilder.AddIcon(BitmapFontIcon.Tank);
+            tipBuilder.Append($"{Lang.Get("Shield")}: {state.LocalShield}");
+            firstTipItem = false;
+        }
+
+        foreach (var status in state.TargetActiveStatus)
+        {
+            if (!firstTipItem)
+                tipBuilder.Append("\n");
+            tipBuilder.Append($"{LuminaWrapper.GetStatusName(status.StatusID)}:");
+            tipBuilder.AddIcon(BitmapFontIcon.DamagePhysical);
+            tipBuilder.Append($"{status.Physical}% ");
+            tipBuilder.AddIcon(BitmapFontIcon.DamageMagical);
+            tipBuilder.Append($"{status.Magical}% ");
+            firstTipItem = false;
+        }
+
+        barEntry.Tooltip = tipBuilder.Build();
+        barEntry.Shown   = true;
+
+        return;
+
+        void AppendSummary
+        (
+            ref SeStringBuilder builder,
+            ref bool            first,
+            BitmapFontIcon      icon,
+            float               value,
+            bool                suffixPercent
+        )
+        {
+            if (value <= 0)
+                return;
+
+            if (!first)
+                builder.Append(" ");
+
+            builder.AddIcon(icon);
+            builder.Append
+            (
+                $"{value:0}" +
+                (suffixPercent ?
+                     "%" :
+                     "")
+            );
+            first = false;
+        }
+    }
+
     #region 事件
 
-    private void OnZoneChanged(ushort obj)
+    private void OnZoneChanged
+    (
+        uint u
+    )
     {
         UnregCombatEvents();
 
@@ -245,7 +373,11 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         RegCombatEvents();
     }
 
-    private void OnConditionChanged(ConditionFlag flag, bool value)
+    private void OnConditionChanged
+    (
+        ConditionFlag flag,
+        bool          value
+    )
     {
         if (flag != ConditionFlag.InCombat) return;
 
@@ -255,7 +387,10 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             UnregCombatEvents();
     }
 
-    private void OnUpdate(IFramework _)
+    private void OnUpdate
+    (
+        IFramework _
+    )
     {
         if (GameState.IsInPVPArea)
         {
@@ -269,148 +404,42 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             return;
         }
 
-        State.Update();
+        state.Update();
         UpdateStatusBar();
     }
 
     #endregion
 
-    private void RegCombatEvents()
-    {
-        if (IsCombatEventsRegistered)
-            return;
-
-        WindowManager.Draw += Draw;
-        FrameworkManager.Instance().Reg(OnUpdate, 500);
-
-        BarEntry         ??= DService.Instance().DTRBar.Get("DailyRoutines-AutoDisplayMitigationInfo");
-        BarEntry.OnClick =   _ => Overlay?.IsOpen ^= true;
-
-        IsCombatEventsRegistered = true;
-    }
-
-    private void UnregCombatEvents()
-    {
-        if (!IsCombatEventsRegistered)
-            return;
-
-        WindowManager.Draw -= Draw;
-        FrameworkManager.Instance().Unreg(OnUpdate);
-        State.Clear();
-
-        if (BarEntry != null)
-        {
-            BarEntry.Shown   = false;
-            BarEntry.Tooltip = null;
-            BarEntry.Text    = null;
-        }
-
-        IsCombatEventsRegistered = false;
-    }
-
-    private static void UpdateStatusBar()
-    {
-        if (BarEntry == null)
-            return;
-
-        if (State.IsLocalEmpty)
-        {
-            BarEntry.Shown   = false;
-            BarEntry.Tooltip = null;
-            BarEntry.Text    = null;
-            return;
-        }
-
-        var textBuilder  = new SeStringBuilder();
-        var firstBarItem = true;
-
-        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.DamagePhysical, State.LocalPhysical, true);
-        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.DamageMagical,  State.LocalMagical,  true);
-        AppendSummary(ref textBuilder, ref firstBarItem, BitmapFontIcon.Tank,           State.LocalShield,   false);
-
-        BarEntry.Text = textBuilder.Build();
-
-        var tipBuilder   = new SeStringBuilder();
-        var firstTipItem = true;
-
-        foreach (var status in State.LocalActiveStatus)
-        {
-            if (!firstTipItem)
-                tipBuilder.Append("\n");
-            tipBuilder.Append($"{LuminaWrapper.GetStatusName(status.StatusID)}:");
-            tipBuilder.AddIcon(BitmapFontIcon.DamagePhysical);
-            tipBuilder.Append($"{status.Physical}% ");
-            tipBuilder.AddIcon(BitmapFontIcon.DamageMagical);
-            tipBuilder.Append($"{status.Magical}% ");
-            firstTipItem = false;
-        }
-
-        if (State.LocalShield > 0)
-        {
-            if (!firstTipItem)
-                tipBuilder.Append("\n");
-            tipBuilder.AddIcon(BitmapFontIcon.Tank);
-            tipBuilder.Append($"{GetLoc("Shield")}: {State.LocalShield}");
-            firstTipItem = false;
-        }
-
-        foreach (var status in State.TargetActiveStatus)
-        {
-            if (!firstTipItem)
-                tipBuilder.Append("\n");
-            tipBuilder.Append($"{LuminaWrapper.GetStatusName(status.StatusID)}:");
-            tipBuilder.AddIcon(BitmapFontIcon.DamagePhysical);
-            tipBuilder.Append($"{status.Physical}% ");
-            tipBuilder.AddIcon(BitmapFontIcon.DamageMagical);
-            tipBuilder.Append($"{status.Magical}% ");
-            firstTipItem = false;
-        }
-
-        BarEntry.Tooltip = tipBuilder.Build();
-        BarEntry.Shown   = true;
-
-        return;
-
-        void AppendSummary(ref SeStringBuilder builder, ref bool first, BitmapFontIcon icon, float value, bool suffixPercent)
-        {
-            if (value <= 0)
-                return;
-
-            if (!first)
-                builder.Append(" ");
-
-            builder.AddIcon(icon);
-            builder.Append($"{value:0}" + (suffixPercent ? "%" : ""));
-            first = false;
-        }
-    }
-
     #region PartyList
 
-    private static unsafe void Draw()
+    private unsafe void Draw()
     {
-        if (Throttler.Throttle("AutoDisplayMitigationInfo-OnUpdatePartyDrawCondition"))
-            IsNeedToDrawOnPartyList = PartyList->IsAddonAndNodesReady() && !GameState.IsInPVPArea;
+        if (Throttler.Shared.Throttle("AutoDisplayMitigationInfo-OnUpdatePartyDrawCondition"))
+            isNeedToDrawOnPartyList = PartyList->IsAddonAndNodesReady() && !GameState.IsInPVPArea;
 
-        if (!IsNeedToDrawOnPartyList)
+        if (!isNeedToDrawOnPartyList)
             return;
 
         var drawList = ImGui.GetBackgroundDrawList();
         var addon    = (AddonPartyList*)PartyList;
 
-        var snapshot = State.PartySnapshot;
-        var count    = snapshot.Length;
+        var snapshot = state.PartySnapshot;
 
-        for (var i = 0; i < count; i++)
-        {
-            ref var partyMember = ref addon->PartyMembers[i];
-            if (partyMember.HPGaugeComponent is null || !partyMember.HPGaugeComponent->OwnerNode->IsVisible())
-                continue;
+        for (var i = 0; i < MathF.Min(snapshot.Length, AgentHUD.Instance()->PartyMemberCount); i++)
+            try
+            {
+                ref var partyMember = ref addon->PartyMembers[i];
+                if (partyMember.HPGaugeComponent is null || !partyMember.HPGaugeComponent->OwnerNode->IsVisible())
+                    continue;
 
-            ref readonly var status = ref snapshot[i];
-            DrawMitigationNode(drawList, ref partyMember, status);
-            DrawShieldNode(drawList, ref partyMember, status);
-        }
+                ref readonly var status = ref snapshot[i];
+                DrawMitigationNode(drawList, ref partyMember, status);
+                DrawShieldNode(drawList, ref partyMember, status);
+            }
+            catch
+            {
+                // ignored
+            }
     }
 
     private static unsafe void DrawMitigationNode
@@ -440,8 +469,8 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         var text     = $"{mitigationValue:N0}%";
         var textSize = ImGui.CalcTextSize(text);
 
-        var posX = nameNode->ScreenX + nameNode->GetWidth() * partyScale - textSize.X - 5 * partyScale;
-        var posY = nameNode->ScreenY                                     + 2              * partyScale;
+        var posX = nameNode->ScreenX + (nameNode->GetWidth() * partyScale) - textSize.X - (5 * partyScale);
+        var posY = nameNode->ScreenY                                       + (2              * partyScale);
 
         var pos = new Vector2(posX, posY);
 
@@ -494,8 +523,8 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
         var text = $"{shieldValue:F0}";
 
-        var posX = numNode->ScreenX                                                    + numNode->GetWidth() * partyListAddon->Scale + 3 * partyScale;
-        var posY = numNode->ScreenY + numNode->GetHeight() * partyListAddon->Scale / 2 - 3f                  * partyScale;
+        var posX = numNode->ScreenX                                                      + (numNode->GetWidth() * partyListAddon->Scale) + (3 * partyScale);
+        var posY = numNode->ScreenY + (numNode->GetHeight() * partyListAddon->Scale / 2) - (3f                  * partyScale);
 
         drawList.AddText(new Vector2(posX + 1, posY + 1), 0x9D00A2FF, text);
         drawList.AddText(new Vector2(posX,     posY),     0xFFFFFFFF, text);
@@ -503,82 +532,130 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
     #endregion
 
-    private readonly struct MitigationDefinition
+    private readonly record struct MitigationDefinition
     (
-        float physical,
-        float magical,
-        bool  onMember
+        float Physical,
+        float Magical,
+        bool  OnMember
     )
     {
-        public float Physical { get; } = physical;
-        public float Magical  { get; } = magical;
-        public bool  OnMember { get; } = onMember;
+        public MitigationValue Value => new(Physical, Magical);
     }
 
-    private readonly struct ActiveMitigation
+    private readonly record struct MitigationValue
     (
-        uint  statusID,
-        float remainingTime,
+        float Physical,
+        float Magical
+    )
+    {
+        public static MitigationValue Empty { get; } = new(0, 0);
+    }
+
+    private struct MitigationFactors
+    (
         float physical,
         float magical
     )
     {
-        public uint  StatusID      { get; } = statusID;
-        public float RemainingTime { get; } = remainingTime;
-        public float Physical      { get; } = physical;
-        public float Magical       { get; } = magical;
+        private float physical = physical;
+        private float magical  = magical;
+
+        public static MitigationFactors Full => new(1f, 1f);
+
+        public void Apply
+        (
+            ReadOnlySpan<ActiveMitigation> statuses
+        )
+        {
+            foreach (var status in statuses)
+                Apply(status.Value);
+        }
+
+        public void Apply
+        (
+            MitigationValue value
+        )
+        {
+            if (value.Physical > 0)
+                physical *= 1f - (value.Physical / 100f);
+            if (value.Magical > 0)
+                magical *= 1f - (value.Magical / 100f);
+        }
+
+        public MitigationValue ToReduction() =>
+            new(ReductionFromFactor(physical), ReductionFromFactor(magical));
+
+        private static float ReductionFromFactor
+        (
+            float factor
+        ) =>
+            factor >= 1f ?
+                0f :
+                (1f - factor) * 100f;
     }
 
-    private readonly struct PartyMitigationSnapshot
+    private readonly record struct ActiveMitigation
     (
-        uint  entityID,
-        float physical,
-        float magical,
-        float shield
+        uint            StatusID,
+        float           RemainingTime,
+        MitigationValue Value
     )
     {
-        public uint  EntityID { get; } = entityID;
-        public float Physical { get; } = physical;
-        public float Magical  { get; } = magical;
-        public float Shield   { get; } = shield;
+        public float Physical => Value.Physical;
+
+        public float Magical => Value.Magical;
+    }
+
+    private readonly record struct PartyMitigationSnapshot
+    (
+        uint            EntityID,
+        MitigationValue Value,
+        float           Shield
+    )
+    {
+        public float Physical => Value.Physical;
+
+        public float Magical => Value.Magical;
+    }
+
+    private sealed record MitigationSnapshot
+    (
+        ActiveMitigation[]        LocalStatuses,
+        ActiveMitigation[]        TargetStatuses,
+        PartyMitigationSnapshot[] PartyMembers,
+        MitigationValue           LocalSummary,
+        float                     LocalShield
+    )
+    {
+        public static MitigationSnapshot Empty { get; } =
+            new([], [], new PartyMitigationSnapshot[9], MitigationValue.Empty, 0);
+
+        public bool IsLocalEmpty =>
+            LocalStatuses.Length == 0 && TargetStatuses.Length == 0 && LocalShield == 0;
     }
 
     private sealed unsafe class MitigationState
     {
-        private          ActiveMitigation[]        localActiveStatusBuffer  = new ActiveMitigation[16];
-        private          ActiveMitigation[]        targetActiveStatusBuffer = new ActiveMitigation[16];
-        private readonly PartyMitigationSnapshot[] partySnapshotBuffer      = new PartyMitigationSnapshot[9];
-        private          int                       localActiveCount;
-        private          int                       targetActiveCount;
-        private          int                       partyCount;
+        private MitigationSnapshot current = MitigationSnapshot.Empty;
 
-        public float LocalShield { get; private set; }
+        public float LocalShield => current.LocalShield;
 
-        public float LocalPhysical { get; private set; }
+        public float LocalPhysical => current.LocalSummary.Physical;
 
-        public float LocalMagical { get; private set; }
+        public float LocalMagical => current.LocalSummary.Magical;
 
-        public bool IsLocalEmpty =>
-            localActiveCount == 0 && LocalShield == 0 && targetActiveCount == 0;
+        public bool IsLocalEmpty => current.IsLocalEmpty;
 
         public ReadOnlySpan<ActiveMitigation> LocalActiveStatus =>
-            localActiveStatusBuffer.AsSpan(0, localActiveCount);
+            current.LocalStatuses;
 
         public ReadOnlySpan<ActiveMitigation> TargetActiveStatus =>
-            targetActiveStatusBuffer.AsSpan(0, targetActiveCount);
+            current.TargetStatuses;
 
         public ReadOnlySpan<PartyMitigationSnapshot> PartySnapshot =>
-            partySnapshotBuffer.AsSpan(0, partyCount);
+            current.PartyMembers.AsSpan(0, Math.Min(AgentHUD.Instance()->PartyMemberCount, current.PartyMembers.Length));
 
-        public void Clear()
-        {
-            localActiveCount  = 0;
-            targetActiveCount = 0;
-            partyCount        = 0;
-            LocalShield       = 0;
-            LocalPhysical     = 0;
-            LocalMagical      = 0;
-        }
+        public void Clear() => current = MitigationSnapshot.Empty;
 
         public void Update()
         {
@@ -592,111 +669,95 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
                 return;
             }
 
-            LocalShield = (float)localPlayer->ShieldValue / 100 * localPlayer->Health;
+            var localStatuses  = CollectLocalStatuses(localPlayer, definitions);
+            var targetStatuses = CollectTargetStatuses(definitions);
+            var localSummary   = CalculateSummary(localStatuses, targetStatuses);
+            var localShield    = CalculateShield(localPlayer);
+            var partyMembers   = BuildPartySnapshot(localPlayer, localSummary, localShield, targetStatuses, definitions);
 
-            UpdateLocal(localPlayer, definitions);
-            UpdateTarget(definitions);
-            UpdateLocalSummaryWithTarget();
-            UpdateParty(localPlayer, definitions);
+            current = new MitigationSnapshot(localStatuses, targetStatuses, partyMembers, localSummary, localShield);
         }
 
-        private void UpdateLocal(GameBattleChara* localPlayer, FrozenDictionary<uint, MitigationDefinition> definitions)
+        private static ActiveMitigation[] CollectLocalStatuses
+        (
+            GameBattleChara*                             localPlayer,
+            FrozenDictionary<uint, MitigationDefinition> definitions
+        )
         {
-            Span<ActiveMitigation> buffer = stackalloc ActiveMitigation[64];
-            var                    count  = 0;
-
-            var factorPhysical = 1f;
-            var factorMagical  = 1f;
+            var statuses = new List<ActiveMitigation>();
 
             foreach (var status in localPlayer->StatusManager.Status)
             {
                 if (status.StatusId == 0)
                     continue;
 
-                if (!TryGetMitigationValues(localPlayer->EntityId, MemberStatus.From(status), definitions, out var physical, out var magical))
+                if (!TryGetMitigationValue(localPlayer->EntityId, MemberStatus.From(status), definitions, out var mitigation))
                     continue;
 
-                AddOrUpdateActiveMitigation(buffer, ref count, status.StatusId, status.RemainingTime, physical, magical);
-
-                MultiplyFactors(physical, magical, ref factorPhysical, ref factorMagical);
+                AddOrUpdateActiveMitigation(statuses, status.StatusId, status.RemainingTime, mitigation);
             }
 
-            LocalPhysical = ReductionFromFactor(factorPhysical);
-            LocalMagical  = ReductionFromFactor(factorMagical);
-
-            StoreSnapshot(ref localActiveStatusBuffer, ref localActiveCount, buffer, count);
+            return statuses.ToArray();
         }
 
-        private void UpdateTarget(FrozenDictionary<uint, MitigationDefinition> definitions)
+        private static ActiveMitigation[] CollectTargetStatuses
+        (
+            FrozenDictionary<uint, MitigationDefinition> definitions
+        )
         {
-            Span<ActiveMitigation> buffer = stackalloc ActiveMitigation[64];
-            var                    count  = 0;
-
+            var statuses      = new List<ActiveMitigation>();
             var currentTarget = TargetManager.Target;
 
-            if (currentTarget is IBattleNPC battleNpc)
+            if (currentTarget is not IBattleNPC battleNpc)
+                return [];
+
+            var statusList = battleNpc.ToBCStruct()->StatusManager.Status;
+
+            foreach (var status in statusList)
             {
-                var statusList = battleNpc.ToBCStruct()->StatusManager.Status;
+                if (status.StatusId == 0)
+                    continue;
 
-                foreach (var status in statusList)
-                {
-                    if (status.StatusId == 0)
-                        continue;
+                if (!definitions.TryGetValue(status.StatusId, out var def))
+                    continue;
 
-                    if (!definitions.TryGetValue(status.StatusId, out var def))
-                        continue;
-
-                    AddOrUpdateActiveMitigation(buffer, ref count, status.StatusId, status.RemainingTime, def.Physical, def.Magical);
-                }
+                AddOrUpdateActiveMitigation(statuses, status.StatusId, status.RemainingTime, def.Value);
             }
 
-            StoreSnapshot(ref targetActiveStatusBuffer, ref targetActiveCount, buffer, count);
+            return statuses.ToArray();
         }
 
-        private void UpdateLocalSummaryWithTarget()
+        private static MitigationValue CalculateSummary
+        (
+            ReadOnlySpan<ActiveMitigation> localStatuses,
+            ReadOnlySpan<ActiveMitigation> targetStatuses
+        )
         {
-            if (targetActiveCount == 0)
-                return;
-
-            var factorPhysical = 1f;
-            var factorMagical  = 1f;
-
-            for (var i = 0; i < localActiveCount; i++)
-            {
-                ref readonly var s = ref localActiveStatusBuffer[i];
-                MultiplyFactors(s.Physical, s.Magical, ref factorPhysical, ref factorMagical);
-            }
-
-            for (var i = 0; i < targetActiveCount; i++)
-            {
-                ref readonly var s = ref targetActiveStatusBuffer[i];
-                MultiplyFactors(s.Physical, s.Magical, ref factorPhysical, ref factorMagical);
-            }
-
-            LocalPhysical = ReductionFromFactor(factorPhysical);
-            LocalMagical  = ReductionFromFactor(factorMagical);
+            var factors = MitigationFactors.Full;
+            factors.Apply(localStatuses);
+            factors.Apply(targetStatuses);
+            return factors.ToReduction();
         }
 
-        private void UpdateParty(GameBattleChara* localPlayer, FrozenDictionary<uint, MitigationDefinition> definitions)
+        private static PartyMitigationSnapshot[] BuildPartySnapshot
+        (
+            GameBattleChara*                             localPlayer,
+            MitigationValue                              localSummary,
+            float                                        localShield,
+            ReadOnlySpan<ActiveMitigation>               targetStatuses,
+            FrozenDictionary<uint, MitigationDefinition> definitions
+        )
         {
-            Span<PartyMitigationSnapshot> buffer = stackalloc PartyMitigationSnapshot[9];
-            buffer.Clear();
-
-            buffer[0] = new PartyMitigationSnapshot(localPlayer->EntityId, LocalPhysical, LocalMagical, LocalShield);
+            var partyMembers = new PartyMitigationSnapshot[9];
+            partyMembers[0] = new PartyMitigationSnapshot(localPlayer->EntityId, localSummary, localShield);
             var maxIndex = 1;
 
-            var enemyPhysicalFactor = 1f;
-            var enemyMagicalFactor  = 1f;
-
-            for (var i = 0; i < targetActiveCount; i++)
-            {
-                ref readonly var s = ref targetActiveStatusBuffer[i];
-                MultiplyFactors(s.Physical, s.Magical, ref enemyPhysicalFactor, ref enemyMagicalFactor);
-            }
+            var enemyFactors = MitigationFactors.Full;
+            enemyFactors.Apply(targetStatuses);
 
             foreach (var member in AgentHUD.Instance()->PartyMembers)
             {
-                if (member.Index < 0 || member.Index >= buffer.Length)
+                if (member.Index < 0 || member.Index >= partyMembers.Length)
                     continue;
 
                 if (member.Index == 0)
@@ -709,48 +770,52 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
 
                 if (entityID == 0 || member.Object == null)
                 {
-                    buffer[member.Index] = new PartyMitigationSnapshot(entityID, 0, 0, 0);
+                    partyMembers[member.Index] = new PartyMitigationSnapshot(entityID, MitigationValue.Empty, 0);
                     continue;
                 }
 
-                var factorPhysical = enemyPhysicalFactor;
-                var factorMagical  = enemyMagicalFactor;
+                var memberFactors = enemyFactors;
 
                 foreach (var status in member.Object->StatusManager.Status)
                 {
                     if (status.StatusId == 0)
                         continue;
 
-                    if (!TryGetMitigationValues(entityID, MemberStatus.From(status), definitions, out var physical, out var magical))
+                    if (!TryGetMitigationValue(entityID, MemberStatus.From(status), definitions, out var mitigation))
                         continue;
 
-                    MultiplyFactors(physical, magical, ref factorPhysical, ref factorMagical);
+                    memberFactors.Apply(mitigation);
                 }
 
-                var physicalReduction = ReductionFromFactor(factorPhysical);
-                var magicalReduction  = ReductionFromFactor(factorMagical);
-                var shield            = (float)member.Object->ShieldValue / 100 * member.Object->Health;
-
-                buffer[member.Index] = new PartyMitigationSnapshot(entityID, physicalReduction, magicalReduction, shield);
+                partyMembers[member.Index] = new PartyMitigationSnapshot
+                (
+                    entityID,
+                    memberFactors.ToReduction(),
+                    CalculateShield(member.Object)
+                );
             }
 
-            buffer[..maxIndex].CopyTo(partySnapshotBuffer);
-            partyCount = maxIndex;
+            return partyMembers[..maxIndex];
         }
 
-        private static bool TryGetMitigationValues
-            (uint targetID, MemberStatus memberStatus, FrozenDictionary<uint, MitigationDefinition> definitions, out float physical, out float magical)
+        private static bool TryGetMitigationValue
+        (
+            uint                                         targetID,
+            MemberStatus                                 memberStatus,
+            FrozenDictionary<uint, MitigationDefinition> definitions,
+            out MitigationValue                          mitigation
+        )
         {
-            physical = 0;
-            magical  = 0;
+            mitigation = MitigationValue.Empty;
 
             var statusID = memberStatus.StatusID;
 
             if (statusID == 2675)
             {
-                var value = memberStatus.SourceID == targetID ? 15f : 10f;
-                physical = value;
-                magical  = value;
+                var value = memberStatus.SourceID == targetID ?
+                                15f :
+                                10f;
+                mitigation = new MitigationValue(value, value);
                 return true;
             }
 
@@ -770,72 +835,45 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
                     }
                 }
 
-                physical = value;
-                magical  = value;
+                mitigation = new MitigationValue(value, value);
                 return true;
             }
 
             if (!definitions.TryGetValue(statusID, out var def))
                 return false;
 
-            physical = def.Physical;
-            magical  = def.Magical;
+            mitigation = def.Value;
             return true;
         }
 
         private static void AddOrUpdateActiveMitigation
-            (Span<ActiveMitigation> buffer, ref int count, uint statusID, float remainingTime, float physical, float magical)
+        (
+            List<ActiveMitigation> statuses,
+            uint                   statusID,
+            float                  remainingTime,
+            MitigationValue        value
+        )
         {
-            for (var i = 0; i < count; i++)
+            for (var i = 0; i < statuses.Count; i++)
             {
-                if (buffer[i].StatusID != statusID)
+                var existing = statuses[i];
+                if (existing.StatusID != statusID)
                     continue;
 
-                if (remainingTime > buffer[i].RemainingTime)
-                    buffer[i] = new ActiveMitigation(statusID, remainingTime, physical, magical);
+                if (remainingTime > existing.RemainingTime)
+                    statuses[i] = new ActiveMitigation(statusID, remainingTime, value);
 
                 return;
             }
 
-            if (count < buffer.Length)
-                buffer[count++] = new ActiveMitigation(statusID, remainingTime, physical, magical);
+            statuses.Add(new ActiveMitigation(statusID, remainingTime, value));
         }
 
-        private static void MultiplyFactors(float physical, float magical, ref float physicalFactor, ref float magicalFactor)
-        {
-            if (physical > 0)
-                physicalFactor *= 1f - physical / 100f;
-            if (magical > 0)
-                magicalFactor *= 1f - magical / 100f;
-        }
-
-        private static float ReductionFromFactor(float factor) =>
-            factor >= 1f ? 0f : (1f - factor) * 100f;
-
-        private static void StoreSnapshot(ref ActiveMitigation[] destination, ref int destinationCount, Span<ActiveMitigation> values, int count)
-        {
-            if (count == 0)
-            {
-                destinationCount = 0;
-                return;
-            }
-
-            EnsureCapacity(ref destination, count);
-            values[..count].CopyTo(destination);
-            destinationCount = count;
-        }
-
-        private static void EnsureCapacity(ref ActiveMitigation[] array, int needed)
-        {
-            if (array.Length >= needed)
-                return;
-
-            var newSize = array.Length == 0 ? 8 : array.Length * 2;
-            if (newSize < needed)
-                newSize = needed;
-
-            array = new ActiveMitigation[newSize];
-        }
+        private static float CalculateShield
+        (
+            GameBattleChara* chara
+        ) =>
+            (float)chara->ShieldValue / 100 * chara->Health;
 
         private readonly struct MemberStatus
         (
@@ -846,7 +884,10 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             public uint StatusID { get; } = statusID;
             public uint SourceID { get; } = sourceID;
 
-            public static MemberStatus From(Status s) =>
+            public static MemberStatus From
+            (
+                Status s
+            ) =>
                 new(s.StatusId, s.SourceObject.ObjectId);
         }
     }
@@ -860,16 +901,19 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
         public static FrozenDictionary<uint, MitigationDefinition> GetStatusDefinitions() =>
             Volatile.Read(ref StatusDefinitions);
 
-        public static async Task FetchMitigationStatusesAsync(CancellationToken ct)
+        public static async Task FetchMitigationStatusesAsync
+        (
+            CancellationToken ct
+        )
         {
             try
             {
-                var json = await HTTPClientHelper.Get().GetStringAsync($"{URI}/mitigation.json", ct).ConfigureAwait(false);
+                var json = await HTTPClientHelper.Instance().Get().GetStringAsync($"{URI}/mitigation.json", ct).ConfigureAwait(false);
                 var resp = JsonConvert.DeserializeObject<MitigationInfoDto[]>(json);
 
                 if (resp == null)
                 {
-                    Error("[AutoDisplayMitigationInfo] 远程减伤技能文件解析失败");
+                    DLog.Error("[AutoDisplayMitigationInfo] 远程减伤技能文件解析失败");
                     return;
                 }
 
@@ -891,28 +935,43 @@ public class AutoDisplayMitigationInfo : DailyModuleBase
             }
             catch (Exception ex)
             {
-                Error($"[AutoDisplayMitigationInfo] 远程减伤技能文件获取失败: {ex}");
+                DLog.Error($"[AutoDisplayMitigationInfo] 远程减伤技能文件获取失败: {ex}");
             }
         }
     }
 
-    private class Config : ModuleConfiguration
+    private class Config : ModuleConfig
     {
-        public bool TransparentOverlay;
-        public bool ResizeableOverlay = true;
         public bool MoveableOverlay   = true;
+        public bool ResizeableOverlay = true;
+        public bool TransparentOverlay;
     }
 
     private sealed class MitigationInfoDto
     {
-        [JsonProperty("id")]         public uint           ID         { get; private set; }
-        [JsonProperty("mitigation")] public StatusInfoDto? Mitigation { get; private set; }
-        [JsonProperty("on_member")]  public bool           OnMember   { get; private set; }
+        [JsonProperty("id")]
+        public uint ID { get; private set; }
+
+        [JsonProperty("mitigation")]
+        public StatusInfoDto? Mitigation { get; private set; }
+
+        [JsonProperty("on_member")]
+        public bool OnMember { get; private set; }
     }
 
     private sealed class StatusInfoDto
     {
-        [JsonProperty("physical")] public float Physical { get; private set; }
-        [JsonProperty("magical")]  public float Magical  { get; private set; }
+        [JsonProperty("physical")]
+        public float Physical { get; private set; }
+
+        [JsonProperty("magical")]
+        public float Magical { get; private set; }
     }
+
+    #region 常量
+
+    private static byte[] DamagePhysicalString { get; } = new SeString(new IconPayload(BitmapFontIcon.DamagePhysical)).Encode();
+    private static byte[] DamageMagicalString  { get; } = new SeString(new IconPayload(BitmapFontIcon.DamageMagical)).Encode();
+
+    #endregion
 }

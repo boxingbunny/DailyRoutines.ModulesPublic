@@ -1,129 +1,167 @@
-using DailyRoutines.Abstracts;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
-using Dalamud.Game.Text.SeStringHandling;
-using Dalamud.Game.Text.SeStringHandling.Payloads;
+using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using OmenTools.Info.Game.Packets.Upstream;
+using OmenTools.OmenService;
 
 namespace DailyRoutines.ModulesPublic;
 
-public class AutoMonsterToss : DailyModuleBase
+public class AutoMonsterToss : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoMonsterTossTitle"),
-        Description = GetLoc("AutoMonsterTossDescription"),
-        Category    = ModuleCategories.GoldSaucer,
+        Title       = Lang.Get("AutoMonsterTossTitle"),
+        Description = Lang.Get("AutoMonsterTossDescription"),
+        Category    = ModuleCategory.GoldSaucer
     };
 
     protected override void Init()
     {
-        TaskHelper ??= new();
+        TaskHelper = new();
 
-        DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "BasketBall", OnAddonSetup);
+        IAddonLifecycle.Instance().RegisterListener(AddonEvent.PostSetup, "BasketBall", OnAddonSetup);
+    }
+
+    protected override unsafe void Uninit()
+    {
+        IAddonLifecycle.Instance().UnregisterListener(OnAddonSetup);
+
+        if (BasketBall->IsAddonAndNodesReady())
+            SendRoundEnd();
     }
 
     protected override void ConfigUI()
     {
-        ConflictKeyText();
-        
+        ImGuiOm.ConflictKeyText();
+
         ImGui.NewLine();
-        
-        using (ImRaii.Disabled(GameState.TerritoryType != 144 || TaskHelper.IsBusy || OccupiedInEvent))
+
+        using (ImRaii.Disabled
+               (
+                   GameState.TerritoryType != 144 ||
+                   TaskHelper.IsBusy              ||
+                   ICondition.Instance().IsOccupiedInEvent
+               ))
         {
-            if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Play, GetLoc("Start")))
-                EnqueueNewRound();
+            if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Play, Lang.Get("Start")))
+                SendInteractWithMachine();
         }
 
         ImGui.SameLine();
-        if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Stop, GetLoc("Stop")))
+
+        if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Stop, Lang.Get("Stop")))
         {
             TaskHelper.Abort();
-            new EventCompletePackt(0x240001, 14).Send();
+            SendRoundEnd();
         }
     }
 
-    private unsafe void OnAddonSetup(AddonEvent type, AddonArgs args)
+    private unsafe void OnAddonSetup
+    (
+        AddonEvent type,
+        AddonArgs  args
+    )
     {
-        if (InterruptByConflictKey(TaskHelper, this)) return;
+        if (TaskHelper.AbortByConflictKey(this)) return;
 
         var currentMGP = 0;
-        
+
         TaskHelper.Abort();
         TaskHelper.Enqueue(WaitSelectStringAddon);
-        TaskHelper.Enqueue(() =>
-        {
-            UpdateSelectStringInfo(GetLoc("AutoMonsterToss-StartingGame"));
-            
-            currentMGP = InventoryManager.Instance()->GetInventoryItemCount(29);
-            new EventActionPacket(0x240001, 0x107000E).Send();
-        });
+        TaskHelper.Enqueue
+        (() =>
+            {
+                UpdateSelectStringInfo(Lang.Get("AutoMonsterToss-StartingGame"));
+
+                currentMGP = InventoryManager.Instance()->GetInventoryItemCount(29);
+                SendNewRound();
+            }
+        );
         TaskHelper.Enqueue(() => InventoryManager.Instance()->GetInventoryItemCount(29) != currentMGP);
         TaskHelper.DelayNext(1000);
-        TaskHelper.Enqueue(() =>
-        {
-            new EventActionPacket(0x240001, 0x108000E, 1).Send();
-            new EventActionPacket(0x240001, 0x108000E, 1).Send();
-            new EventActionPacket(0x240001, 0x108000E, 1).Send();
-            new EventActionPacket(0x240001, 0x108000E, 1).Send();
-            new EventActionPacket(0x240001, 0x108000E, 1).Send();
-        });
+        TaskHelper.Enqueue(SendPlayGame);
 
-        const int maxTime = 25;
-        for (var i = 0; i < maxTime; i++)
+        for (var i = 0; i < GAME_TIME_SECONDS; i++)
         {
             var second = i;
             TaskHelper.DelayNext(1000);
-            TaskHelper.Enqueue(() => UpdateSelectStringInfo(GetLoc("AutoMonsterToss-WaitingForResult", maxTime - second)));
+            TaskHelper.Enqueue
+                (() => UpdateSelectStringInfo(Lang.Get("AutoMonsterToss-WaitingForResult", GAME_TIME_SECONDS - second)));
         }
-                
-        TaskHelper.Enqueue(() => new EventCompletePackt(0x240001, 14).Send());
-        TaskHelper.Enqueue(EnqueueNewRound);
+
+        TaskHelper.Enqueue(SendRoundEnd);
+        TaskHelper.Enqueue(() => !ICondition.Instance().IsOccupiedInEvent);
+        TaskHelper.Enqueue(SendInteractWithMachine);
     }
-    
-    private bool EnqueueNewRound()
-    {
-        if (InterruptByConflictKey(TaskHelper, this)) return true;
-        if (OccupiedInEvent) return false;
-        
-        new EventStartPackt(LocalPlayerState.EntityID, 0x240001).Send();
-        return true;
-    }
-    
+
     private static unsafe bool WaitSelectStringAddon() =>
         SelectString->IsAddonAndNodesReady() && BasketBall->IsAddonAndNodesReady();
-    
-    private static unsafe void UpdateSelectStringInfo(string info)
+
+    private static void SendInteractWithMachine() =>
+        new EventStartPackt(LocalPlayerState.EntityID, EVENT_ID).Send();
+
+    private static void SendNewRound() =>
+        new EventActionPacket(EVENT_ID, ROUND_START_CATEGORY).Send();
+
+    private static void SendPlayGame()
     {
-        if (!SelectString->IsAddonAndNodesReady() || !BasketBall->IsAddonAndNodesReady()) return;
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 1).Send();
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 1).Send();
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 1).Send();
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 1).Send();
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 1).Send();
+    }
+
+    private static void SendRoundEnd() =>
+        new EventCompletePackt(EVENT_ID, 14).Send();
+
+    private static unsafe void UpdateSelectStringInfo
+    (
+        string info
+    )
+    {
+        if (!SelectString->IsAddonAndNodesReady() ||
+            !BasketBall->IsAddonAndNodesReady())
+            return;
 
         var list = SelectString->GetComponentListById(3);
         var text = SelectString->GetTextNodeById(2);
         if (list == null || text == null) return;
-        
+
         list->OwnerNode->ToggleVisibility(false);
         list->SetEnabledState(false);
 
         text->FontSize      = 18;
         text->AlignmentType = AlignmentType.Center;
 
-        var builder = new SeStringBuilder();
-        builder.AddUiForeground(28);
-        builder.AddText($"[{GetLoc("AutoMonsterTossTitle")}]");
-        builder.AddUiForegroundOff();
-        builder.Add(NewLinePayload.Payload);
-        builder.AddText(info);
-        
-        text->SetText(builder.Encode());
+        using var rented = new RentedSeStringBuilder();
+
+        var builder = rented.Builder;
+        builder.PushColorType(28)
+               .Append($"[{Lang.Get("AutoMonsterTossTitle")}]")
+               .PopColorType()
+               .AppendNewLine()
+               .Append(info);
+
+        text->SetText(builder.GetViewAsSpan());
         text->SetPositionFloat(20, 60);
     }
 
-    protected override unsafe void Uninit()
-    {
-        DService.Instance().AddonLifecycle.UnregisterListener(OnAddonSetup);
-        
-        if (BasketBall->IsAddonAndNodesReady())
-            new EventCompletePackt(0x240001, 14).Send();
-    }
+    #region Constants
+
+    private const uint EVENT_ID = 0x240001;
+
+    private const uint ROUND_START_CATEGORY = 0x107000E;
+
+    private const uint PLAY_GAME_CATEGORY = 0x108000E;
+
+    private const int GAME_TIME_SECONDS = 25;
+
+    #endregion
 }

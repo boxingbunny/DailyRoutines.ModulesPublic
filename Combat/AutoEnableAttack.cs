@@ -1,47 +1,78 @@
-using System.Collections.Generic;
-using DailyRoutines.Abstracts;
-using Dalamud.Game.ClientState.Conditions;
+using System.Collections.Frozen;
+using System.Numerics;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
 using FFXIVClientStructs.FFXIV.Client.Game;
-using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using OmenTools.Interop.Game;
+using OmenTools.Interop.Game.Lumina;
+using OmenTools.OmenService;
+using Action = Lumina.Excel.Sheets.Action;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class AutoEnableAttack : DailyModuleBase
+public class AutoEnableAttack : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoEnableAttackTitle"),
-        Description = GetLoc("AutoEnableAttackDescription"),
-        Category    = ModuleCategories.Combat,
+        Title       = Lang.Get("AutoEnableAttackTitle"),
+        Description = Lang.Get("AutoEnableAttackDescription"),
+        Category    = ModuleCategory.Combat
     };
 
-    private static readonly HashSet<uint> InvalidActions = [7385, 7418, 23288, 23289, 34581, 23273];
-    
-    protected override void Init() => 
-        UseActionManager.Instance().RegPostUseAction(OnPostUseAction);
+    private MemoryPatch autoAttackPatch = null!;
 
-    private static void OnPostUseAction(
-        bool                        result,
-        ActionType                  actionType,
-        uint                        actionID,
-        ulong                       targetID,
-        uint                        extraParam,
-        ActionManager.UseActionMode queueState,
-        uint                        comboRouteID)
+    protected override void Init()
     {
-        if (actionType != ActionType.Action || targetID == 0xE000_0000 || InvalidActions.Contains(actionID)) return;
+        autoAttackPatch = new("41 0F B6 46 ?? FF C8", [0xB8, 0x02, 0x00, 0x00, 0x00]);
 
-
-        if (GameState.IsInPVPArea                       ||
-            !DService.Instance().Condition[ConditionFlag.InCombat] ||
-            DService.Instance().Condition[ConditionFlag.Casting])
-            return;
-        
-        if (UIState.Instance()->WeaponState.AutoAttackState.IsAutoAttacking) return;
-
-        ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.AutoAttack, 1, (uint)targetID);
+        UseActionManager.Instance().RegPreUseActionLocation(OnPreUseAction);
+        UseActionManager.Instance().RegPostUseActionLocation(OnPostUseAction);
     }
 
-    protected override void Uninit() => 
+    protected override void Uninit()
+    {
+        UseActionManager.Instance().Unreg(OnPreUseAction);
         UseActionManager.Instance().Unreg(OnPostUseAction);
+    }
+
+    private void OnPreUseAction
+    (
+        ref bool       isPrevented,
+        ref ActionType type,
+        ref uint       actionID,
+        ref ulong      targetID,
+        ref Vector3    location,
+        ref uint       extraParam,
+        ref byte       a7
+    )
+    {
+        if (type != ActionType.Action ||
+            !LuminaGetter.TryGetRow(actionID, out Action row))
+        {
+            autoAttackPatch.Disable();
+            return;
+        }
+
+        autoAttackPatch.Set(BehavioursToModify.Contains(row.AutoAttackBehaviour));
+    }
+
+    private void OnPostUseAction
+    (
+        bool       result,
+        ActionType actionType,
+        uint       actionID,
+        ulong      targetID,
+        Vector3    location,
+        uint       extraParam,
+        byte       a7
+    ) =>
+        autoAttackPatch.Disable();
+
+    private static readonly FrozenSet<byte> BehavioursToModify =
+    [
+        1, // 咏唱
+        2, // 战技
+        4  // AOE
+    ];
 }

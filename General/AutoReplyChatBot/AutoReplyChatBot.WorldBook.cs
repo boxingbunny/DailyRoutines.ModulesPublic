@@ -1,34 +1,16 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Text;
 
 namespace DailyRoutines.ModulesPublic;
 
 public partial class AutoReplyChatBot
 {
-    private static void UpdateGameContextInWorldBook()
-    {
-        if (ModuleConfig is not { EnableGameContext: true }) return;
-
-        var contextParts = new List<string>();
-
-        foreach (var contextType in Enum.GetValues<GameContextType>())
-        {
-            if (ModuleConfig.GameContextSettings.TryGetValue(contextType, out var enabled) && enabled)
-            {
-                var value = GameContextValueMap[contextType]();
-                contextParts.Add($"{contextType}:{value}");
-            }
-        }
-
-        var context = string.Join(", ", contextParts);
-        ModuleConfig.WorldBookEntry["GameContext"] = context;
-    }
-
     private static class WorldBookManager
     {
-        public static List<KeyValuePair<string, string>> FindRelevantEntries(string userMessage, Dictionary<string, string> entries)
+        public static List<KeyValuePair<string, string>> FindRelevantEntries
+        (
+            string                     userMessage,
+            Dictionary<string, string> entries
+        )
         {
             if (string.IsNullOrWhiteSpace(userMessage) || entries is not { Count: > 0 })
                 return [];
@@ -40,14 +22,8 @@ public partial class AutoReplyChatBot
 
             var scored = new List<(int Score, KeyValuePair<string, string> Entry)>(entries.Count);
 
-            if (ModuleConfig is { EnableGameContext: true }             &&
-                entries.TryGetValue("GameContext", out var gameContext) &&
-                !string.IsNullOrWhiteSpace(gameContext))
-                scored.Add((int.MaxValue, new KeyValuePair<string, string>("GameContext", gameContext)));
-
             foreach (var entry in entries)
             {
-                if (entry.Key == "GameContext") continue;
                 if (string.IsNullOrWhiteSpace(entry.Key)) continue;
                 if (string.IsNullOrWhiteSpace(entry.Value)) continue;
 
@@ -84,7 +60,11 @@ public partial class AutoReplyChatBot
                    .ToList();
         }
 
-        public static string BuildWorldBookContext(List<KeyValuePair<string, string>> matches, int maxLength)
+        public static string BuildWorldBookContext
+        (
+            List<KeyValuePair<string, string>> matches,
+            int                                maxLength
+        )
         {
             var context = new StringBuilder();
             context.AppendLine("[WorldBookInfo]");
@@ -107,7 +87,10 @@ public partial class AutoReplyChatBot
             return context.ToString();
         }
 
-        private static HashSet<string> Tokenize(string text)
+        private static HashSet<string> Tokenize
+        (
+            string text
+        )
         {
             var tokens = new HashSet<string>(StringComparer.Ordinal);
             if (string.IsNullOrWhiteSpace(text)) return tokens;

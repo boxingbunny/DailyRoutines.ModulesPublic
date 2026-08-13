@@ -1,85 +1,157 @@
-using System;
-using DailyRoutines.Abstracts;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
-using FFXIVClientStructs.FFXIV.Client.Game.Control;
-using Lumina.Excel.Sheets;
-using GameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
+using Dalamud.Utility;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Component.GUI;
+using OmenTools.Info.Game.Packets.Upstream;
+using OmenTools.OmenService;
 
 namespace DailyRoutines.ModulesPublic;
 
-public class AutoHummer : DailyModuleBase
+public class AutoHummer : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoCTSTitle"),
-        Description = GetLoc("AutoCTSDescription"),
-        Category    = ModuleCategories.GoldSaucer,
+        Title       = Lang.Get("AutoHummerTitle"),
+        Description = Lang.Get("AutoHummerDescription"),
+        Category    = ModuleCategory.GoldSaucer
     };
 
     protected override void Init()
     {
-        TaskHelper ??= new() { TimeoutMS = 10000 };
-        DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Hummer", OnAddonSetup);
+        TaskHelper = new();
+
+        IAddonLifecycle.Instance().RegisterListener(AddonEvent.PostSetup, "Hummer", OnAddonSetup);
     }
 
-    protected override void ConfigUI() => ConflictKeyText();
-
-    private void OnAddonSetup(AddonEvent type, AddonArgs args)
+    protected override unsafe void Uninit()
     {
-        if (InterruptByConflictKey(TaskHelper, this)) return;
+        IAddonLifecycle.Instance().UnregisterListener(OnAddonSetup);
 
-        TaskHelper.Enqueue(WaitSelectStringAddon);
-        TaskHelper.Enqueue(ClickGameButton);
+        if (Hummer->IsAddonAndNodesReady())
+            SendRoundEnd();
     }
 
-    private bool WaitSelectStringAddon()
+    protected override void ConfigUI()
     {
-        if (InterruptByConflictKey(TaskHelper, this)) return true;
-        return ClickSelectString(0);
-    }
+        ImGuiOm.ConflictKeyText();
 
-    private unsafe bool ClickGameButton()
-    {
-        if (InterruptByConflictKey(TaskHelper, this)) return true;
+        ImGui.NewLine();
 
-        if (!Hummer->IsAddonAndNodesReady())
-            return false;
-
-        var button = Hummer->GetComponentButtonById(29);
-        if (button == null || !button->IsEnabled) return false;
-
-        Hummer->IsVisible = false;
-
-        Hummer->Callback(11, 3, 0);
-
-        // 只是纯粹因为游玩动画太长了而已
-        TaskHelper.DelayNext(5000);
-        TaskHelper.Enqueue(StartAnotherRound);
-        return true;
-    }
-
-    private unsafe bool StartAnotherRound()
-    {
-        if (InterruptByConflictKey(TaskHelper, this)) return true;
-        if (OccupiedInEvent) return false;
-        
-        var machineTarget = TargetManager.PreviousTarget;
-        var machine =
-            machineTarget.Name.TextValue.Contains(LuminaGetter.GetRow<EObjName>(2005035)!.Value.Singular.ToString(),
-                                                      StringComparison.OrdinalIgnoreCase)
-                ? (GameObject*)machineTarget.Address
-                : null;
-
-        if (machine != null)
+        using (ImRaii.Disabled
+               (
+                   GameState.TerritoryType != 144 ||
+                   TaskHelper.IsBusy              ||
+                   ICondition.Instance().IsOccupiedInEvent
+               ))
         {
-            TargetSystem.Instance()->InteractWithObject(machine);
-            return true;
+            if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Play, Lang.Get("Start")))
+                SendInteractWithMachine();
         }
 
-        return false;
+        ImGui.SameLine();
+
+        if (ImGuiOm.ButtonIconWithText(FontAwesomeIcon.Stop, Lang.Get("Stop")))
+        {
+            TaskHelper.Abort();
+            SendRoundEnd();
+        }
     }
 
-    protected override void Uninit() => 
-        DService.Instance().AddonLifecycle.UnregisterListener(OnAddonSetup);
+    private unsafe void OnAddonSetup
+    (
+        AddonEvent type,
+        AddonArgs  args
+    )
+    {
+        if (TaskHelper.AbortByConflictKey(this)) return;
+
+        var currentMGP = 0;
+
+        TaskHelper.Abort();
+        TaskHelper.Enqueue(WaitSelectStringAddon);
+        TaskHelper.Enqueue
+        (() =>
+            {
+                UpdateSelectStringInfo(Lang.Get("AutoHummer-StartingRound"));
+
+                currentMGP = InventoryManager.Instance()->GetInventoryItemCount(29);
+                SendNewRound();
+            }
+        );
+        TaskHelper.Enqueue(() => InventoryManager.Instance()->GetInventoryItemCount(29) != currentMGP);
+        TaskHelper.DelayNext(1000);
+        TaskHelper.Enqueue
+        (() =>
+            {
+                UpdateSelectStringInfo($"{Lang.Get("AutoHummer-WaitingForResult")}......");
+                SendPlayGame();
+            }
+        );
+        TaskHelper.DelayNext(5000);
+        TaskHelper.Enqueue(SendRoundEnd);
+        TaskHelper.Enqueue(() => !ICondition.Instance().IsOccupiedInEvent);
+        TaskHelper.Enqueue(SendInteractWithMachine);
+    }
+
+    private static unsafe bool WaitSelectStringAddon() =>
+        SelectString->IsAddonAndNodesReady() && Hummer->IsAddonAndNodesReady();
+
+    private static void SendInteractWithMachine() =>
+        new EventStartPackt(LocalPlayerState.EntityID, EVENT_ID).Send();
+
+    private static void SendNewRound() =>
+        new EventActionPacket(EVENT_ID, ROUND_START_CATEGORY).Send();
+
+    private static void SendPlayGame() =>
+        new EventActionPacket(EVENT_ID, PLAY_GAME_CATEGORY, 3, param2: 1).Send();
+
+    private static void SendRoundEnd() =>
+        new EventCompletePackt(EVENT_ID, 14).Send();
+
+    private static unsafe void UpdateSelectStringInfo
+    (
+        string info
+    )
+    {
+        if (!SelectString->IsAddonAndNodesReady() ||
+            !Hummer->IsAddonAndNodesReady())
+            return;
+
+        var list = SelectString->GetComponentListById(3);
+        var text = SelectString->GetTextNodeById(2);
+        if (list == null || text == null) return;
+
+        list->OwnerNode->ToggleVisibility(false);
+        list->SetEnabledState(false);
+
+        text->FontSize      = 18;
+        text->AlignmentType = AlignmentType.Center;
+
+        using var rented = new RentedSeStringBuilder();
+
+        var builder = rented.Builder;
+        builder.PushColorType(28)
+               .Append($"[{Lang.Get("AutoHummerTitle")}]")
+               .PopColorType()
+               .AppendNewLine()
+               .Append(info);
+
+        text->SetText(builder.GetViewAsSpan());
+        text->SetPositionFloat(20, 60);
+    }
+
+    #region Constants
+
+    private const uint EVENT_ID = 0x240003;
+
+    private const uint ROUND_START_CATEGORY = 0x107000E;
+
+    private const uint PLAY_GAME_CATEGORY = 0x108000E;
+
+    #endregion
 }

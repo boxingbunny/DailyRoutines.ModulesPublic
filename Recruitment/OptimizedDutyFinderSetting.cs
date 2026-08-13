@@ -1,71 +1,87 @@
-using System;
-using System.Collections.Generic;
 using System.Numerics;
-using DailyRoutines.Abstracts;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Utility.Numerics;
 using FFXIVClientStructs.FFXIV.Client.UI;
-using KamiToolKit.Timelines;
 using KamiToolKit.Nodes;
+using KamiToolKit.Timelines;
+using OmenTools.Interop.Game.Helpers;
+using OmenTools.Interop.Game.Lumina;
+using OmenTools.Interop.Game.Models;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
+public unsafe class OptimizedDutyFinderSetting : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("OptimizedDutyFinderSettingTitle"),
-        Description = GetLoc("OptimizedDutyFinderSettingDescription"),
-        Category    = ModuleCategories.Recruitment,
+        Title       = Lang.Get("OptimizedDutyFinderSettingTitle"),
+        Description = Lang.Get("OptimizedDutyFinderSettingDescription"),
+        Category    = ModuleCategory.Recruitment,
         Author      = ["Mizami", "Cyf5119"]
     };
-    
+
     public override ModulePermission Permission { get; } = new() { AllDefaultEnabled = true };
 
-    private delegate void SetContentsFinderSettingsInitDelegate(byte* data, UIModule* module);
-    private static readonly SetContentsFinderSettingsInitDelegate SetContentsFinderSettingsInit =
-        new CompSig("E8 ?? ?? ?? ?? 49 8B 06 45 33 FF 49 8B CE 45 89 7E 20 FF 50 28 B0 01").GetDelegate<SetContentsFinderSettingsInitDelegate>();
+    private delegate void SetContentsFinderSettingsInitDelegate
+    (
+        byte*     data,
+        UIModule* module
+    );
 
-    private static HorizontalListNode? LayoutNode;
-    
-    private static readonly Dictionary<DutyFinderSettingDisplay, (IconButtonNode? ButtonNode, IconImageNode? ImageNode)> Nodes = [];
+    private SetContentsFinderSettingsInitDelegate SetContentsFinderSettingsInit = null!;
+
+    private HorizontalListNode? layoutNode;
+
+    private readonly Dictionary<DutyFinderSettingDisplay, (IconButtonNode? ButtonNode, IconImageNode? ImageNode)> nodes = [];
 
     protected override void Init()
     {
+        SetContentsFinderSettingsInit = new CompSig("E8 ?? ?? ?? ?? 49 8B 06 45 33 FF 49 8B CE 45 89 7E 20 FF 50 28 B0 01")
+            .GetDelegate<SetContentsFinderSettingsInitDelegate>();
+
         DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PostDraw,    ["ContentsFinder", "RaidFinder"], OnAddon);
         DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PostRefresh, ["ContentsFinder", "RaidFinder"], OnAddon);
         DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PreFinalize, ["ContentsFinder", "RaidFinder"], OnAddon);
     }
-    
+
     protected override void Uninit()
     {
         DService.Instance().AddonLifecycle.UnregisterListener(OnAddon);
-        OnAddon(AddonEvent.PreFinalize, null);
+
+        foreach (var (buttonNode, imageNode) in nodes.Values)
+        {
+            buttonNode?.Dispose();
+            imageNode?.Dispose();
+        }
+
+        nodes.Clear();
+
+        layoutNode?.Dispose();
+        layoutNode = null;
     }
 
-    private static void OnAddon(AddonEvent type, AddonArgs args)
+    private void OnAddon
+    (
+        AddonEvent type,
+        AddonArgs  args
+    )
     {
         switch (type)
         {
             case AddonEvent.PreFinalize:
-                foreach (var (buttonNode, imageNode) in Nodes.Values)
-                {
-                    buttonNode?.Dispose();
-                    imageNode?.Dispose();
-                }
-
-                Nodes.Clear();
-
-                LayoutNode?.Dispose();
-                LayoutNode = null;
+                nodes.Clear();
+                layoutNode = null;
                 break;
             case AddonEvent.PostRefresh:
             case AddonEvent.PostDraw:
                 var addon = args.Addon.ToStruct();
                 if (addon == null) return;
 
-                if (LayoutNode == null)
+                if (layoutNode == null)
                 {
                     var defaultContainer = addon->GetNodeById(6);
                     if (defaultContainer == null) return;
@@ -75,25 +91,25 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
                     var attchTargetNode = addon->GetNodeById(4);
                     if (attchTargetNode == null) return;
 
-                    LayoutNode = new HorizontalListNode
+                    layoutNode = new HorizontalListNode
                     {
                         IsVisible   = true,
                         Size        = new(defaultContainer->Width, defaultContainer->Height),
                         Position    = new(defaultContainer->X - 5, defaultContainer->Y),
                         ItemSpacing = 0
                     };
-                    LayoutNode.AttachNode(attchTargetNode);
+                    layoutNode.AttachNode(attchTargetNode);
 
                     foreach (var settingDetail in DutyFinderSettingIcons)
                     {
-                        if (Nodes.ContainsKey(settingDetail)) continue;
+                        if (nodes.ContainsKey(settingDetail)) continue;
 
                         var button = new IconButtonNode
                         {
                             IsVisible   = true,
                             Size        = new(32),
                             Position    = new(0, -5f),
-                            TextTooltip = LuminaWrapper.GetAddonText(settingDetail.GetTooltip()),
+                            TextTooltip = LuminaWrapper.GetAddonText(settingDetail.GetTooltip())
                         };
 
                         button.OnClick = () =>
@@ -117,19 +133,22 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
                             FitTexture = true
                         };
 
-                        iconNode.AddTimeline(new TimelineBuilder()
-                                             .AddFrameSetWithFrame(1,  10, 1,  position: origPosition)
-                                             .AddFrameSetWithFrame(11, 17, 11, position: origPosition)
-                                             .AddFrameSetWithFrame(18, 26, 18, position: origPosition + new Vector2(0.0f, 1.0f))
-                                             .AddFrameSetWithFrame(27, 36, 27, position: origPosition)
-                                             .AddFrameSetWithFrame(37, 46, 37, position: origPosition)
-                                             .AddFrameSetWithFrame(47, 53, 47, position: origPosition)
-                                             .Build());
+                        iconNode.AddTimeline
+                        (
+                            new TimelineBuilder()
+                                .AddFrameSetWithFrame(1,  10, 1,  origPosition)
+                                .AddFrameSetWithFrame(11, 17, 11, origPosition)
+                                .AddFrameSetWithFrame(18, 26, 18, origPosition + new Vector2(0.0f, 1.0f))
+                                .AddFrameSetWithFrame(27, 36, 27, origPosition)
+                                .AddFrameSetWithFrame(37, 46, 37, origPosition)
+                                .AddFrameSetWithFrame(47, 53, 47, origPosition)
+                                .Build()
+                        );
 
                         iconNode.AttachNode(button);
 
-                        Nodes[settingDetail] = (button, iconNode);
-                        LayoutNode.AddNode(button);
+                        nodes[settingDetail] = (button, iconNode);
+                        layoutNode.AddNode(button);
                     }
 
                     if (GetLanguageButtons() is { Count: > 0 } langButtons)
@@ -161,24 +180,34 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
                             languageButton.ImageNode.IsVisible      = false;
 
                             languageButton.AttachNode(parentNode);
-                            Nodes[langSetting] = (languageButton, null);
+                            nodes[langSetting] = (languageButton, null);
                         }
                     }
                 }
 
-                foreach (var (settingDetail, (buttonNode, imageNode)) in Nodes)
+                foreach (var (settingDetail, (buttonNode, imageNode)) in nodes)
                 {
                     var value = GetCurrentSettingValue(settingDetail.Setting);
-                    
+
                     if (imageNode != null)
                     {
                         imageNode.IconId = settingDetail.GetIcon();
 
                         if (settingDetail.Setting is DutyFinderSetting.LevelSync &&
                             GetCurrentSettingValue(DutyFinderSetting.UnrestrictedParty) == 0)
-                            imageNode.Color = buttonNode.Color.WithW(value != 0 ? 1 : 0.25f);
+                            imageNode.Color = buttonNode.Color.WithW
+                            (
+                                value != 0 ?
+                                    1 :
+                                    0.25f
+                            );
                         else
-                            imageNode.Color = buttonNode.Color.WithW(value != 0 ? 1 : 0.5f);
+                            imageNode.Color = buttonNode.Color.WithW
+                            (
+                                value != 0 ?
+                                    1 :
+                                    0.5f
+                            );
                     }
 
                     buttonNode.TextTooltip = LuminaWrapper.GetAddonText(settingDetail.GetTooltip());
@@ -188,36 +217,54 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
         }
     }
 
-    private static byte GetCurrentSettingValue(DutyFinderSetting dutyFinderSetting)
+    private static byte GetCurrentSettingValue
+    (
+        DutyFinderSetting dutyFinderSetting
+    )
     {
         var option = ContentsFinderOption.Get();
         return dutyFinderSetting switch
         {
-            DutyFinderSetting.Ja => IsLangConfigReady()
-                                        ? (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeJA")
-                                        : (byte)0,
-            DutyFinderSetting.En => IsLangConfigReady()
-                                        ? (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeEN")
-                                        : (byte)0,
-            DutyFinderSetting.De => IsLangConfigReady()
-                                        ? (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeDE")
-                                        : (byte)0,
-            DutyFinderSetting.Fr => IsLangConfigReady()
-                                        ? (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeFR")
-                                        : (byte)0,
-            DutyFinderSetting.JoinPartyInProgress     => (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderSupplyEnable"),
-            DutyFinderSetting.LootRule                => (byte)option.LootRules,
-            DutyFinderSetting.UnrestrictedParty       => option.UnrestrictedParty ? (byte)1 : (byte)0,
-            DutyFinderSetting.LevelSync               => option.LevelSync ? (byte)1 : (byte)0,
-            DutyFinderSetting.MinimumIl               => option.MinimalIL ? (byte)1 : (byte)0,
-            DutyFinderSetting.SilenceEcho             => option.SilenceEcho ? (byte)1 : (byte)0,
-            DutyFinderSetting.ExplorerMode            => option.ExplorerMode ? (byte)1 : (byte)0,
-            DutyFinderSetting.LimitedLevelingRoulette => option.IsLimitedLevelingRoulette ? (byte)1 : (byte)0,
-            _                                         => 0
+            DutyFinderSetting.Ja => IsLangConfigReady() ?
+                                        (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeJA") :
+                                        (byte)0,
+            DutyFinderSetting.En => IsLangConfigReady() ?
+                                        (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeEN") :
+                                        (byte)0,
+            DutyFinderSetting.De => IsLangConfigReady() ?
+                                        (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeDE") :
+                                        (byte)0,
+            DutyFinderSetting.Fr => IsLangConfigReady() ?
+                                        (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderUseLangTypeFR") :
+                                        (byte)0,
+            DutyFinderSetting.JoinPartyInProgress => (byte)DService.Instance().GameConfig.UiConfig.GetUInt("ContentsFinderSupplyEnable"),
+            DutyFinderSetting.LootRule            => (byte)option.LootRules,
+            DutyFinderSetting.UnrestrictedParty => option.UnrestrictedParty ?
+                                                       (byte)1 :
+                                                       (byte)0,
+            DutyFinderSetting.LevelSync => option.LevelSync ?
+                                               (byte)1 :
+                                               (byte)0,
+            DutyFinderSetting.MinimumIl => option.MinimalIL ?
+                                               (byte)1 :
+                                               (byte)0,
+            DutyFinderSetting.SilenceEcho => option.SilenceEcho ?
+                                                 (byte)1 :
+                                                 (byte)0,
+            DutyFinderSetting.ExplorerMode => option.ExplorerMode ?
+                                                  (byte)1 :
+                                                  (byte)0,
+            DutyFinderSetting.LimitedLevelingRoulette => option.IsLimitedLevelingRoulette ?
+                                                             (byte)1 :
+                                                             (byte)0,
+            _ => 0
         };
     }
 
-    private static void ToggleSetting(DutyFinderSetting setting)
+    private void ToggleSetting
+    (
+        DutyFinderSetting setting
+    )
     {
         if (IsLangConfigReady() && setting is DutyFinderSetting.Ja or DutyFinderSetting.En or DutyFinderSetting.De or DutyFinderSetting.Fr)
         {
@@ -235,7 +282,9 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
         if (setting == DutyFinderSetting.LootRule)
             newValue = (byte)((array[(int)setting] + 1) % 3);
         else
-            newValue = (byte)(array[(int)setting] == 0 ? 1 : 0);
+            newValue = (byte)(array[(int)setting] == 0 ?
+                                  1 :
+                                  0);
 
         array[(int)setting] = newValue;
 
@@ -247,6 +296,7 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
     {
         var array      = new byte[27];
         var nbSettings = Enum.GetValues<DutyFinderSetting>().Length;
+
         for (var i = 0; i < nbSettings; i++)
         {
             array[i]              = GetCurrentSettingValue((DutyFinderSetting)i);
@@ -259,9 +309,8 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
     }
 
     private static List<DutyFinderSettingDisplay> GetLanguageButtons() =>
-        !IsLangConfigReady()
-            ? []
-            :
+        !IsLangConfigReady() ?
+            [] :
             [
                 new DutyFinderSettingDisplay(DutyFinderSetting.Ja, 0, 10),
                 new DutyFinderSettingDisplay(DutyFinderSetting.En, 0, 11),
@@ -303,9 +352,17 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
         LimitedLevelingRoulette = 11
     }
 
-    private record DutyFinderSettingDisplay(DutyFinderSetting Setting)
+    private record DutyFinderSettingDisplay
+    (
+        DutyFinderSetting Setting
+    )
     {
-        public DutyFinderSettingDisplay(DutyFinderSetting setting, uint icon, uint tooltip) : this(setting)
+        public DutyFinderSettingDisplay
+        (
+            DutyFinderSetting setting,
+            uint              icon,
+            uint              tooltip
+        ) : this(setting)
         {
             GetIcon    = () => icon;
             GetTooltip = () => tooltip;
@@ -315,7 +372,7 @@ public unsafe class OptimizedDutyFinderSetting : DailyModuleBase
         public Func<uint>? GetTooltip { get; init; }
     }
 
-    private static readonly List<DutyFinderSettingDisplay> DutyFinderSettingIcons =
+    private static readonly DutyFinderSettingDisplay[] DutyFinderSettingIcons =
     [
         new(DutyFinderSetting.JoinPartyInProgress, 60644, 2519),
         new(DutyFinderSetting.UnrestrictedParty, 60641, 10008),

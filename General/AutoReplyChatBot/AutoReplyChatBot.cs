@@ -1,44 +1,49 @@
-using System;
-using System.Linq;
-using System.Net;
-using System.Net.Http;
-using System.Security.Authentication;
-using DailyRoutines.Abstracts;
-using DailyRoutines.Helpers;
+using System.Collections.Concurrent;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
+using Dalamud.Game.Chat;
 using Dalamud.Game.Text;
-using Dalamud.Game.Text.SeStringHandling;
+using OmenTools.OmenService;
 
 namespace DailyRoutines.ModulesPublic;
 
-public partial class AutoReplyChatBot : DailyModuleBase
+public partial class AutoReplyChatBot : ModuleBase
 {
-    private static Config ModuleConfig = null!;
-
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoReplyChatBotTitle"),
-        Description = GetLoc("AutoReplyChatBotDescription"),
-        Category    = ModuleCategories.General,
+        Title       = Lang.Get("AutoReplyChatBotTitle"),
+        Description = Lang.Get("AutoReplyChatBotDescription"),
+        Category    = ModuleCategory.General,
         Author      = ["Wotou"]
     };
 
     public override ModulePermission Permission { get; } = new() { NeedAuth = true };
 
+
+    private RateLimiter?  rateLimiter;
+    private ChatPipeline? pipeline;
+
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> activePipelines = new(StringComparer.OrdinalIgnoreCase);
+
     protected override void Init()
     {
-        ModuleConfig = LoadConfig<Config>() ?? new();
+        config = Config.Load(this) ?? new();
 
-        if (ModuleConfig.SystemPrompts is not { Count: > 0 })
+        if (config.SystemPrompts is not { Count: > 0 })
         {
-            ModuleConfig.SystemPrompts       = [new()];
-            ModuleConfig.SelectedPromptIndex = 0;
+            config.SystemPrompts       = [new()];
+            config.SelectedPromptIndex = 0;
         }
 
-        foreach (var contextType in Enum.GetValues<GameContextType>())
-            ModuleConfig.GameContextSettings.TryAdd(contextType, true);
+        config.SystemPrompts = config.SystemPrompts.DistinctBy(x => x.Name).ToList();
 
-        ModuleConfig.SystemPrompts = ModuleConfig.SystemPrompts.DistinctBy(x => x.Name).ToList();
-        SaveConfig(ModuleConfig);
+        rateLimiter       = new RateLimiter();
+        conversationStore = new ConversationStore(ConfigDirectoryPath);
+        pipeline          = new ChatPipeline(this);
+
+        _ = conversationStore.PruneAsync();
 
         DService.Instance().Chat.ChatMessage += OnChat;
     }
@@ -46,30 +51,64 @@ public partial class AutoReplyChatBot : DailyModuleBase
     protected override void Uninit()
     {
         DService.Instance().Chat.ChatMessage -= OnChat;
+
+        foreach (var (_, cts) in activePipelines)
+        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+                /* ignored */
+            }
+
+            cts.Dispose();
+        }
+
+        activePipelines.Clear();
+        conversationStore?.Dispose();
+        rateLimiter?.Dispose();
+
         FlushSaveConfig();
         DisposeSaveConfigScheduler();
-        DisposeAllSessions();
     }
 
-    private static void OnChat(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
+    private void OnChat
+    (
+        IHandleableChatMessage message
+    )
     {
-        if (!ModuleConfig.ValidChatTypes.Contains(type)) return;
+        if (!config.ValidChatTypes.Contains(message.LogKind)) return;
 
-        var (playerName, worldID, worldName) = ExtractNameWorld(sender);
+        var (playerName, worldID, worldName) = ExtractNameWorld(message.Sender);
         if (string.IsNullOrEmpty(playerName) || string.IsNullOrEmpty(worldName)) return;
-        if (playerName == LocalPlayerState.Name    && worldID == GameState.HomeWorld) return;
-        if (type       == XivChatType.TellIncoming && ModuleConfig.OnlyReplyNonFriendTell && IsFriend(playerName, worldID)) return;
+        if (playerName      == LocalPlayerState.Name    && worldID == GameState.HomeWorld) return;
+        if (message.LogKind == XivChatType.TellIncoming && config.OnlyReplyNonFriendTell && IsFriend(playerName, worldID)) return;
 
-        var userText = message.TextValue;
+        var userText = message.Message.TextValue;
         if (string.IsNullOrWhiteSpace(userText)) return;
 
-        var historyKey = $"{playerName}@{worldName}";
-        AppendHistory(historyKey, "user", userText);
+        var target = $"{playerName}@{worldName}";
 
-        var helper = GetSession(historyKey).TaskHelper;
-        helper.Abort();
-        helper.DelayNext(1000, "等待 1 秒收集更多消息");
-        helper.Enqueue(() => IsCooldownReady(historyKey));
-        helper.EnqueueAsync(ct => GenerateAndReplyAsync(playerName, worldName, type, ct));
+        var newCts = new CancellationTokenSource();
+        var oldCts = activePipelines.GetOrAdd(target, newCts);
+
+        if (oldCts != newCts)
+        {
+            try
+            {
+                oldCts.Cancel();
+            }
+            catch
+            {
+                /* ignored */
+            }
+
+            oldCts.Dispose();
+            activePipelines[target] = newCts;
+        }
+
+        _ = pipeline!.ExecuteAsync(playerName, worldID, worldName, message.LogKind, userText, newCts.Token);
     }
 }

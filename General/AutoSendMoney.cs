@@ -1,63 +1,60 @@
-using System;
 using System.Collections.Frozen;
-using System.Collections.Generic;
-using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using DailyRoutines.Abstracts;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
+using DailyRoutines.Extensions;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Hooking;
-using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
+using OmenTools.Dalamud;
+using OmenTools.Info.Lumina;
+using OmenTools.Interop.Game.Lumina;
+using OmenTools.Interop.Game.Models;
+using OmenTools.OmenService;
+using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 using ObjectKind = Dalamud.Game.ClientState.Objects.Enums.ObjectKind;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class AutoSendMoney : DailyModuleBase
+public unsafe class AutoSendMoney : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("AutoSendMoneyTitle"),
-        Description = GetLoc("AutoSendMoneyDescription"),
-        Category    = ModuleCategories.General,
+        Title       = Lang.Get("AutoSendMoneyTitle"),
+        Description = Lang.Get("AutoSendMoneyDescription"),
+        Category    = ModuleCategory.General,
         Author      = ["status102"]
     };
 
     public override ModulePermission Permission { get; } = new() { NeedAuth = true };
-    
-    private const uint MAXIMUM_GIL_PER_TRADE = 1_000_000;
 
-    private static readonly CompSig TradeRequestSig = new("48 89 6C 24 ?? 56 57 41 56 48 83 EC ?? 48 8B E9 44 8B F2 48 8D 0D");
+    private bool IsRunning => runtime != null;
 
-    private static readonly CompSig TradeStatusUpdateSig = new
-    (
-        "E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 4C 8B C2 8B D1 48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 48 8D 0D"
-    );
+    private Config config = null!;
 
-    private static Config ModuleConfig = null!;
-    private static int[]  MoneyButtons = [];
+    private int[] moneyButtons = [];
 
-    private static readonly List<Member>           Members  = [];
-    private static readonly Dictionary<uint, long> EditPlan = [];
+    private readonly List<Member>           members  = [];
+    private readonly Dictionary<uint, long> editPlan = [];
 
-    private static float  NameLength = -1;
-    private static double PlanAll;
-    private static long   CurrentChange;
+    private float  nameLength = -1;
+    private double planAll;
+    private long   currentChange;
 
-    private static SendMoneyRuntime? Runtime;
-
-    private static bool IsRunning => Runtime != null;
+    private SendMoneyRuntime? runtime;
 
     protected override void Init()
     {
-        ModuleConfig = LoadConfig<Config>() ?? new();
+        config = Config.Load(this) ?? new();
 
         ValidateConfigChanges();
         TaskHelper ??= new() { TimeoutMS = 5_000 };
@@ -65,82 +62,86 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
     protected override void Uninit() =>
         Stop();
-    
+
     #region UI
 
     protected override void ConfigUI()
     {
-        if (NameLength < 0)
-            NameLength = ImGui.CalcTextSize(GetLoc("All")).X;
+        if (nameLength < 0)
+            nameLength = ImGui.CalcTextSize(Lang.Get("All")).X;
 
-        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{GetLoc("Settings")}");
+        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{Lang.Get("Settings")}");
 
         using (ImRaii.PushIndent())
-        using (ImRaii.ItemWidth(100f * GlobalFontScale))
+        using (ImRaii.ItemWidth(100f * GlobalUIScale))
         {
-            ImGui.InputInt($"{GetLoc("AutoSendMoney-Step", 1)}##Step1Input", ref ModuleConfig.Step1, flags: ImGuiInputTextFlags.CharsDecimal);
+            ImGui.InputInt($"{Lang.Get("AutoSendMoney-Step", 1)}##Step1Input", ref config.Step1, flags: ImGuiInputTextFlags.CharsDecimal);
+
             if (ImGui.IsItemDeactivatedAfterEdit())
             {
                 ValidateConfigChanges();
-                ModuleConfig.Save(this);
+                config.Save(this);
             }
-            
-            ImGui.InputInt($"{GetLoc("AutoSendMoney-Step", 2)}##Step2Input", ref ModuleConfig.Step2, flags: ImGuiInputTextFlags.CharsDecimal);
+
+            ImGui.InputInt($"{Lang.Get("AutoSendMoney-Step", 2)}##Step2Input", ref config.Step2, flags: ImGuiInputTextFlags.CharsDecimal);
+
             if (ImGui.IsItemDeactivatedAfterEdit())
             {
                 ValidateConfigChanges();
-                ModuleConfig.Save(this);
+                config.Save(this);
             }
-            
-            ImGui.InputInt($"{GetLoc("AutoSendMoney-DelayLowerLimit")}##DelayLowerLimitInput", ref ModuleConfig.Delay1, flags: ImGuiInputTextFlags.CharsDecimal);
+
+            ImGui.InputInt($"{Lang.Get("AutoSendMoney-DelayLowerLimit")}##DelayLowerLimitInput", ref config.Delay1, flags: ImGuiInputTextFlags.CharsDecimal);
+
             if (ImGui.IsItemDeactivatedAfterEdit())
             {
                 ValidateConfigChanges();
-                ModuleConfig.Save(this);
+                config.Save(this);
             }
-            
-            ImGui.InputInt($"{GetLoc("AutoSendMoney-DelayUpperLimit")}##DelayUpperLimitInput", ref ModuleConfig.Delay2, flags: ImGuiInputTextFlags.CharsDecimal);
+
+            ImGui.InputInt($"{Lang.Get("AutoSendMoney-DelayUpperLimit")}##DelayUpperLimitInput", ref config.Delay2, flags: ImGuiInputTextFlags.CharsDecimal);
+
             if (ImGui.IsItemDeactivatedAfterEdit())
             {
                 ValidateConfigChanges();
-                ModuleConfig.Save(this);
+                config.Save(this);
             }
         }
 
         ImGui.NewLine();
 
-        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{GetLoc("Control")}");
-        
+        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{Lang.Get("Control")}");
+
         using (ImRaii.PushIndent())
         {
             using (ImRaii.Disabled(IsRunning))
             {
-                if (ImGui.Button($"{FontAwesomeIcon.FlagCheckered.ToIconString()} {GetLoc("Start")}"))
+                if (ImGui.Button($"{FontAwesomeIcon.FlagCheckered.ToIconString()} {Lang.Get("Start")}"))
                     Start();
             }
 
             ImGui.SameLine();
-            if (ImGui.Button($"{FontAwesomeIcon.Stop.ToIconString()} {GetLoc("Stop")}"))
+            if (ImGui.Button($"{FontAwesomeIcon.Stop.ToIconString()} {Lang.Get("Stop")}"))
                 Stop();
         }
-        
+
         ImGui.NewLine();
-        
-        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{GetLoc("AutoSendMoney-ListToTrade")}");
+
+        ImGui.TextColored(KnownColor.LightSkyBlue.ToVector4(), $"{Lang.Get("AutoSendMoney-ListToTrade")}");
 
         using (ImRaii.PushIndent())
         {
-            if (ImGui.Button(GetLoc("AutoSendMoney-AddPartyList")))
+            if (ImGui.Button(Lang.Get("AutoSendMoney-AddPartyList")))
                 AddPartyMembers();
 
             ImGui.SameLine();
-            if (ImGui.Button(GetLoc("AutoSendMoney-AddTarget")))
+            if (ImGui.Button(Lang.Get("AutoSendMoney-AddTarget")))
                 AddCurrentTarget();
-            
+
             using (ImRaii.PushId("All"))
                 DrawGlobalPlan();
 
-            foreach (var p in Members)
+            foreach (var p in members)
             {
                 using (ImRaii.PushId(p.EntityID.ToString()))
                     DrawMemberPlan(p);
@@ -148,89 +149,92 @@ public unsafe class AutoSendMoney : DailyModuleBase
         }
     }
 
-    private static void DrawGlobalPlan()
+    private void DrawGlobalPlan()
     {
         using var group   = ImRaii.Group();
-        var       hasPlan = EditPlan.Count > 0;
+        var       hasPlan = editPlan.Count > 0;
 
         if (ImGui.Checkbox("##AllHasPlan", ref hasPlan))
         {
             if (hasPlan)
             {
-                foreach (var p in Members)
+                foreach (var p in members)
                 {
-                    if (EditPlan.ContainsKey(p.EntityID)) continue;
-                    EditPlan.Add(p.EntityID, (long)(PlanAll * 10000));
+                    if (editPlan.ContainsKey(p.EntityID)) continue;
+                    editPlan.Add(p.EntityID, (long)(planAll * 10000));
                 }
             }
             else
-                EditPlan.Clear();
+                editPlan.Clear();
         }
 
         ImGui.SameLine();
-        ImGui.TextUnformatted(GetLoc("All"));
+        ImGui.TextUnformatted(Lang.Get("All"));
 
         using var disabled = ImRaii.Disabled(IsRunning);
 
-        ImGui.SameLine(NameLength + 60);
+        ImGui.SameLine(nameLength + 60);
 
-        ImGui.SetNextItemWidth(80f * GlobalFontScale);
-        ImGui.InputDouble($"{GetLoc("Wan")}##AllMoney", ref PlanAll, 0, 0, "%.1lf", ImGuiInputTextFlags.CharsDecimal);
+        ImGui.SetNextItemWidth(80f * GlobalUIScale);
+        ImGui.InputDouble($"{Lang.Get("Wan")}##AllMoney", ref planAll, 0, 0, "%.1lf", ImGuiInputTextFlags.CharsDecimal);
 
         if (ImGui.IsItemDeactivatedAfterEdit())
         {
-            var keys = EditPlan.Keys.ToArray();
+            var keys = editPlan.Keys.ToArray();
             foreach (var key in keys)
-                EditPlan[key] = (long)(PlanAll * 10000);
+                editPlan[key] = (long)(planAll * 10000);
         }
 
-        CurrentChange = 0;
+        currentChange = 0;
 
-        foreach (var num in MoneyButtons)
+        foreach (var num in moneyButtons)
         {
             ImGui.SameLine();
-            ImGui.SetNextItemWidth(15f * GlobalFontScale);
+            ImGui.SetNextItemWidth(15f * GlobalUIScale);
             var display = $"{(num < 0 ? string.Empty : '+')}{num}";
             if (ImGui.Button($"{display}##All"))
-                CurrentChange = num * 1_0000;
+                currentChange = num * 1_0000;
         }
 
-        if (CurrentChange != 0)
+        if (currentChange != 0)
         {
-            PlanAll += CurrentChange / 10000.0;
+            planAll += currentChange / 10000.0;
 
-            foreach (var p in Members)
+            foreach (var p in members)
             {
-                if (!EditPlan.TryAdd(p.EntityID, CurrentChange))
-                    EditPlan[p.EntityID] += CurrentChange;
+                if (!editPlan.TryAdd(p.EntityID, currentChange))
+                    editPlan[p.EntityID] += currentChange;
             }
         }
 
         ImGui.SameLine();
 
-        if (ImGui.Button($"{GetLoc("Reset")}###ResetAll"))
+        if (ImGui.Button($"{Lang.Get("Reset")}###ResetAll"))
         {
-            PlanAll = 0;
+            planAll = 0;
 
-            var keys = EditPlan.Keys.ToArray();
+            var keys = editPlan.Keys.ToArray();
             foreach (var key in keys)
-                EditPlan[key] = 0;
+                editPlan[key] = 0;
         }
     }
 
-    private static void DrawMemberPlan(Member p)
+    private void DrawMemberPlan
+    (
+        Member p
+    )
     {
         using var group   = ImRaii.Group();
-        var       hasPlan = EditPlan.ContainsKey(p.EntityID);
+        var       hasPlan = editPlan.ContainsKey(p.EntityID);
 
         using (ImRaii.Disabled(IsRunning))
         {
             if (ImGui.Checkbox($"##{p.FullName}-CheckBox", ref hasPlan))
             {
                 if (hasPlan)
-                    EditPlan.Add(p.EntityID, (long)(PlanAll * 10000));
+                    editPlan.Add(p.EntityID, (long)(planAll * 10000));
                 else
-                    EditPlan.Remove(p.EntityID);
+                    editPlan.Remove(p.EntityID);
             }
         }
 
@@ -243,43 +247,45 @@ public unsafe class AutoSendMoney : DailyModuleBase
         ImGui.SameLine();
         ImGui.TextUnformatted(p.FullName);
 
-        ImGui.SameLine(NameLength + 60);
+        ImGui.SameLine(nameLength + 60);
         if (!hasPlan)
             return;
 
         if (IsRunning)
-            ImGui.TextUnformatted(GetLoc("AutoSendMoney-Count", Runtime?.GetRemaining(p.EntityID) ?? 0));
+            ImGui.TextUnformatted(Lang.Get("AutoSendMoney-Count", runtime?.GetRemaining(p.EntityID) ?? 0));
         else
         {
-            ImGui.SetNextItemWidth(80f * GlobalFontScale);
-            var value = EditPlan.TryGetValue(p.EntityID, out var valueToken) ? valueToken / 10000.0 : 0;
-            ImGui.InputDouble($"{GetLoc("Wan")}##{p.EntityID}-Money", ref value, 0, 0, "%.1lf", ImGuiInputTextFlags.CharsDecimal);
+            ImGui.SetNextItemWidth(80f * GlobalUIScale);
+            var value = editPlan.TryGetValue(p.EntityID, out var valueToken) ?
+                            valueToken / 10000.0 :
+                            0;
+            ImGui.InputDouble($"{Lang.Get("Wan")}##{p.EntityID}-Money", ref value, 0, 0, "%.1lf", ImGuiInputTextFlags.CharsDecimal);
             if (ImGui.IsItemDeactivatedAfterEdit())
-                EditPlan[p.EntityID] = (long)(value * 10000);
+                editPlan[p.EntityID] = (long)(value * 10000);
 
-            CurrentChange = 0;
+            currentChange = 0;
 
-            foreach (var num in MoneyButtons)
+            foreach (var num in moneyButtons)
             {
                 ImGui.SameLine();
-                ImGui.SetNextItemWidth(15f * GlobalFontScale);
+                ImGui.SetNextItemWidth(15f * GlobalUIScale);
                 var display = $"{(num < 0 ? string.Empty : '+')}{num}";
                 if (ImGui.Button($"{display}##Single_{p.EntityID}"))
-                    CurrentChange = num * 1_0000;
+                    currentChange = num * 1_0000;
             }
 
-            if (CurrentChange != 0)
-                EditPlan[p.EntityID] = (long)(value * 10000) + CurrentChange;
+            if (currentChange != 0)
+                editPlan[p.EntityID] = (long)(value * 10000) + currentChange;
 
             ImGui.SameLine();
-            if (ImGui.Button($"{GetLoc("Reset")}###ResetSingle-{p.EntityID}"))
-                EditPlan[p.EntityID] = 0;
+            if (ImGui.Button($"{Lang.Get("Reset")}###ResetSingle-{p.EntityID}"))
+                editPlan[p.EntityID] = 0;
         }
     }
 
-    public static void AddPartyMembers()
+    public void AddPartyMembers()
     {
-        Members.Clear();
+        members.Clear();
         var cwProxy = InfoProxyCrossRealm.Instance();
 
         if (cwProxy->IsCrossRealm)
@@ -308,19 +314,23 @@ public unsafe class AutoSendMoney : DailyModuleBase
             }
         }
 
-        var removedKeys = EditPlan.Keys.Where(k => Members.All(m => m.EntityID != k)).ToArray();
+        var removedKeys = editPlan.Keys.Where(k => members.All(m => m.EntityID != k)).ToArray();
         foreach (var key in removedKeys)
-            EditPlan.Remove(key);
+            editPlan.Remove(key);
 
-        foreach (var item in Members)
-            EditPlan.TryAdd(item.EntityID, 0);
+        foreach (var item in members)
+            editPlan.TryAdd(item.EntityID, 0);
 
-        NameLength = Members.Select(p => ImGui.CalcTextSize(p.FullName).X)
-                            .Append(ImGui.CalcTextSize(GetLoc("All")).X)
+        nameLength = members.Select(p => ImGui.CalcTextSize(p.FullName).X)
+                            .Append(ImGui.CalcTextSize(Lang.Get("All")).X)
                             .Max();
     }
 
-    private static void AddCrossRealmGroupMembers(CrossRealmGroup crossRealmGroup, int groupIndex)
+    private void AddCrossRealmGroupMembers
+    (
+        CrossRealmGroup crossRealmGroup,
+        int             groupIndex
+    )
     {
         for (var i = 0; i < crossRealmGroup.GroupMemberCount; i++)
         {
@@ -329,30 +339,36 @@ public unsafe class AutoSendMoney : DailyModuleBase
         }
     }
 
-    private static void AddMember(uint entityID, string fullName, ushort worldID, int groupIndex = -1)
+    private void AddMember
+    (
+        uint   entityID,
+        string fullName,
+        ushort worldID,
+        int    groupIndex = -1
+    )
     {
         if (string.IsNullOrWhiteSpace(fullName))
             return;
-        if (!PresetSheet.Worlds.TryGetValue(worldID, out var world))
+        if (!Sheets.Worlds.TryGetValue(worldID, out var world))
             return;
 
-        Members.Add(new() { EntityID = entityID, FirstName = fullName, World = world.Name.ToString(), GroupIndex = groupIndex });
+        members.Add(new() { EntityID = entityID, FirstName = fullName, World = world.Name.ToString(), GroupIndex = groupIndex });
     }
 
-    private static void AddCurrentTarget()
+    private void AddCurrentTarget()
     {
         var target = TargetSystem.Instance()->GetTargetObject();
 
         if (target is not null &&
-            DService.Instance().ObjectTable.SearchByEntityID(target->EntityId) is ICharacter { ObjectKind: ObjectKind.Player } player)
+            DService.Instance().ObjectTable.SearchByEntityID(target->EntityId) is ICharacter { ObjectKind: ObjectKind.Pc } player)
         {
-            if (Members.Any(p => p.EntityID == player.EntityID))
+            if (members.Any(p => p.EntityID == player.EntityID))
                 return;
 
-            Members.Add(new(player));
-            EditPlan.TryAdd(player.EntityID, 0);
-            NameLength = Members.Select(p => ImGui.CalcTextSize(p.FullName).X)
-                                .Append(ImGui.CalcTextSize(GetLoc("All")).X)
+            members.Add(new(player));
+            editPlan.TryAdd(player.EntityID, 0);
+            nameLength = members.Select(p => ImGui.CalcTextSize(p.FullName).X)
+                                .Append(ImGui.CalcTextSize(Lang.Get("All")).X)
                                 .Max();
         }
     }
@@ -363,68 +379,71 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
     private void Start()
     {
-        if (Runtime != null) return;
+        if (runtime != null) return;
         ValidateConfigChanges();
-        Runtime = new SendMoneyRuntime(this);
+        runtime = new SendMoneyRuntime(this);
     }
 
-    private static void Stop()
+    private void Stop()
     {
-        Runtime?.Dispose();
-        Runtime = null;
+        runtime?.Dispose();
+        runtime = null;
     }
 
     #endregion
 
     #region 工具
 
-    private static bool IsWithinTradeDistance(Vector3 pos2)
+    private static bool IsWithinTradeDistance
+    (
+        Vector3 pos2
+    )
     {
         if (DService.Instance().ObjectTable.LocalPlayer is not { } localPlayer)
             return false;
 
         var delta      = localPlayer.Position - pos2;
-        var distanceSq = delta.X * delta.X    + delta.Z * delta.Z;
+        var distanceSq = (delta.X * delta.X)  + (delta.Z * delta.Z);
         return distanceSq < 16;
     }
-    
-    private static int GetRandomDelayMS()
+
+    private int GetRandomDelayMS()
     {
-        var min = Math.Max(0, ModuleConfig.Delay1);
-        var max = Math.Max(0, ModuleConfig.Delay2);
+        var min = Math.Max(0, config.Delay1);
+        var max = Math.Max(0, config.Delay2);
         if (max <= min) return min;
         return Random.Shared.Next(min, max);
     }
 
-    private static void ValidateConfigChanges()
+    private void ValidateConfigChanges()
     {
-        ModuleConfig.Step1 = Math.Abs(ModuleConfig.Step1);
-        ModuleConfig.Step2 = Math.Abs(ModuleConfig.Step2);
+        config.Step1 = Math.Abs(config.Step1);
+        config.Step2 = Math.Abs(config.Step2);
 
-        if (ModuleConfig.Step1 == 0) ModuleConfig.Step1 = 50;
-        if (ModuleConfig.Step2 == 0) ModuleConfig.Step2 = 100;
-        if (ModuleConfig.Step2 < ModuleConfig.Step1)
-            (ModuleConfig.Step1, ModuleConfig.Step2) = (ModuleConfig.Step2, ModuleConfig.Step1);
+        if (config.Step1 == 0) config.Step1 = 50;
+        if (config.Step2 == 0) config.Step2 = 100;
+        if (config.Step2 < config.Step1)
+            (config.Step1, config.Step2) = (config.Step2, config.Step1);
 
-        ModuleConfig.Delay1 = Math.Max(0, ModuleConfig.Delay1);
-        ModuleConfig.Delay2 = Math.Max(0, ModuleConfig.Delay2);
-        if (ModuleConfig.Delay2 < ModuleConfig.Delay1)
-            (ModuleConfig.Delay1, ModuleConfig.Delay2) = (ModuleConfig.Delay2, ModuleConfig.Delay1);
-        if (ModuleConfig.Delay2 == ModuleConfig.Delay1)
-            ModuleConfig.Delay2 = ModuleConfig.Delay1 + 1;
+        config.Delay1 = Math.Max(0, config.Delay1);
+        config.Delay2 = Math.Max(0, config.Delay2);
+        if (config.Delay2 < config.Delay1)
+            (config.Delay1, config.Delay2) = (config.Delay2, config.Delay1);
+        if (config.Delay2 == config.Delay1)
+            config.Delay2 = config.Delay1 + 1;
 
-        MoneyButtons =
+        moneyButtons =
         [
-            -ModuleConfig.Step2,
-            -ModuleConfig.Step1,
-            ModuleConfig.Step1,
-            ModuleConfig.Step2
+            -config.Step2,
+            -config.Step1,
+            config.Step1,
+            config.Step2
         ];
     }
 
     #endregion
 
-    private class Config : ModuleConfiguration
+    private class Config : ModuleConfig
     {
         public int Delay1 = 200;
         public int Delay2 = 500;
@@ -441,10 +460,13 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
         public Member() { }
 
-        public Member(ICharacter gameObject)
+        public Member
+        (
+            ICharacter gameObject
+        )
         {
             EntityID  = gameObject.EntityID;
-            FirstName = gameObject.Name.TextValue;
+            FirstName = gameObject.Name;
 
             var worldID = gameObject.ToBCStruct()->HomeWorld;
             World = LuminaWrapper.GetWorldName(worldID) ?? "???";
@@ -462,6 +484,30 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
     private sealed class SendMoneyRuntime : IDisposable
     {
+        private static readonly CompSig TradeRequestSig = new("48 89 6C 24 ?? 56 57 41 56 48 83 EC ?? 48 8B E9 44 8B F2 48 8D 0D");
+
+        private delegate nint TradeRequestDelegate
+        (
+            InventoryManager* manager,
+            uint              entityID
+        );
+
+        private Hook<TradeRequestDelegate>? TradeRequestHook;
+
+        private static readonly CompSig TradeStatusUpdateSig = new
+        (
+            "E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 4C 8B C2 8B D1 48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 48 8D 0D"
+        );
+
+        private delegate nint TradeStatusUpdateDelegate
+        (
+            InventoryManager* manager,
+            nint              entityID,
+            nint              a3
+        );
+
+        private Hook<TradeStatusUpdateDelegate>? TradeStatusUpdateHook;
+
         private readonly AutoSendMoney          owner;
         private readonly HashSet<uint>          pendingTradeRequests = [];
         private readonly Dictionary<uint, long> tradePlan;
@@ -469,23 +515,22 @@ public unsafe class AutoSendMoney : DailyModuleBase
         private          uint                   currentMoney;
         private          bool                   isDisposed;
 
-        private bool                             isTrading;
-        private uint                             lastTradeEntityID;
-        private Hook<TradeRequestDelegate>?      tradeRequestHook;
-        private Hook<TradeStatusUpdateDelegate>? tradeStatusUpdateHook;
+        private bool isTrading;
+        private uint lastTradeEntityID;
 
-        private static readonly FrozenSet<uint> TradeFinishLogMessages = [10920, 10921, 10922, 10923];
-
-        public SendMoneyRuntime(AutoSendMoney owner)
+        public SendMoneyRuntime
+        (
+            AutoSendMoney owner
+        )
         {
             this.owner = owner;
-            tradePlan  = [.. EditPlan.Where(i => i.Value > 0)];
+            tradePlan  = [.. owner.editPlan.Where(i => i.Value > 0)];
 
-            tradeRequestHook = TradeRequestSig.GetHook<TradeRequestDelegate>(OnTradeRequest);
-            tradeRequestHook.Enable();
+            TradeRequestHook = TradeRequestSig.GetHook<TradeRequestDelegate>(OnTradeRequest);
+            TradeRequestHook.Enable();
 
-            tradeStatusUpdateHook = TradeStatusUpdateSig.GetHook<TradeStatusUpdateDelegate>(OnTradeStatusUpdate);
-            tradeStatusUpdateHook.Enable();
+            TradeStatusUpdateHook = TradeStatusUpdateSig.GetHook<TradeStatusUpdateDelegate>(OnTradeStatusUpdate);
+            TradeStatusUpdateHook.Enable();
 
             DService.Instance().AddonLifecycle.RegisterListener(AddonEvent.PostSetup, "Trade", OnTradeAddonSetup);
             FrameworkManager.Instance().Reg(OnFrameworkTick, 1_000);
@@ -505,50 +550,65 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
             LogMessageManager.Instance().Unreg(OnLogMessage);
 
-            tradeRequestHook?.Dispose();
-            tradeRequestHook = null;
+            TradeRequestHook?.Dispose();
+            TradeRequestHook = null;
 
-            tradeStatusUpdateHook?.Dispose();
-            tradeStatusUpdateHook = null;
+            TradeStatusUpdateHook?.Dispose();
+            TradeStatusUpdateHook = null;
 
             owner.TaskHelper?.Abort();
         }
 
-        public long GetRemaining(uint entityID) =>
+        public long GetRemaining
+        (
+            uint entityID
+        ) =>
             tradePlan.GetValueOrDefault(entityID, 0);
-        
-        private void OnLogMessage(uint logMessageID, LogMessageQueueItem item)
+
+        private void OnLogMessage
+        (
+            uint                logMessageID,
+            LogMessageQueueItem item
+        )
         {
             if (!TradeFinishLogMessages.Contains(logMessageID)) return;
             if (Trade == null) return;
-            
+
             Trade->Close(true);
             CompleteTrade();
         }
 
-        private void OnTradeAddonSetup(AddonEvent type, AddonArgs args)
+        private void OnTradeAddonSetup
+        (
+            AddonEvent type,
+            AddonArgs  args
+        )
         {
             owner.TaskHelper?.Abort();
             pendingTradeRequests.Clear();
 
             if (!tradePlan.TryGetValue(lastTradeEntityID, out var value))
             {
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(CancelTradeAddon, nameof(CancelTradeAddon));
             }
             else
             {
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(() => SetTradeGil((uint)Math.Min(value, MAXIMUM_GIL_PER_TRADE)), nameof(SetTradeGil));
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(ConfirmPreCheck, nameof(ConfirmPreCheck));
             }
         }
 
-        private nint OnTradeRequest(InventoryManager* manager, uint entityID)
+        private nint OnTradeRequest
+        (
+            InventoryManager* manager,
+            uint              entityID
+        )
         {
-            if (tradeRequestHook == null) return 0;
-            var ret = tradeRequestHook.Original(manager, entityID);
+            if (TradeRequestHook == null) return 0;
+            var ret = TradeRequestHook.Original(manager, entityID);
 
             if (ret == 0)
                 BeginTrade(entityID);
@@ -558,7 +618,12 @@ public unsafe class AutoSendMoney : DailyModuleBase
             return ret;
         }
 
-        private nint OnTradeStatusUpdate(InventoryManager* manager, nint entityID, nint a3)
+        private nint OnTradeStatusUpdate
+        (
+            InventoryManager* manager,
+            nint              entityID,
+            nint              a3
+        )
         {
             var eventType = Marshal.ReadByte(a3 + 4);
 
@@ -590,10 +655,15 @@ public unsafe class AutoSendMoney : DailyModuleBase
                     break;
             }
 
-            return tradeStatusUpdateHook == null ? 0 : tradeStatusUpdateHook.Original(manager, entityID, a3);
+            return TradeStatusUpdateHook == null ?
+                       0 :
+                       TradeStatusUpdateHook.Original(manager, entityID, a3);
         }
 
-        private void BeginTrade(uint entityID)
+        private void BeginTrade
+        (
+            uint entityID
+        )
         {
             currentMoney      = 0;
             checkState        = default;
@@ -602,7 +672,11 @@ public unsafe class AutoSendMoney : DailyModuleBase
             pendingTradeRequests.Remove(entityID);
         }
 
-        private void UpdatePreCheck(uint objectID, bool confirm)
+        private void UpdatePreCheck
+        (
+            uint objectID,
+            bool confirm
+        )
         {
             if (objectID == LocalPlayerState.EntityID)
                 checkState = checkState with { SelfConfirmed = confirm };
@@ -611,14 +685,14 @@ public unsafe class AutoSendMoney : DailyModuleBase
 
             if (!tradePlan.TryGetValue(lastTradeEntityID, out var value))
             {
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(CancelTradeAddon, nameof(CancelTradeAddon));
                 return;
             }
 
             if (currentMoney <= value && checkState is { SelfConfirmed: false, OtherConfirmed: true })
             {
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(ConfirmPreCheck, nameof(ConfirmPreCheck));
             }
         }
@@ -627,7 +701,7 @@ public unsafe class AutoSendMoney : DailyModuleBase
         {
             if (tradePlan.TryGetValue(lastTradeEntityID, out var value) && currentMoney <= value)
             {
-                owner.TaskHelper?.DelayNext(GetRandomDelayMS());
+                owner.TaskHelper?.DelayNext(owner.GetRandomDelayMS());
                 owner.TaskHelper?.Enqueue(() => FinalCheckTradeAddon(), nameof(FinalCheckTradeAddon));
             }
         }
@@ -648,7 +722,7 @@ public unsafe class AutoSendMoney : DailyModuleBase
             checkState = default;
 
             if (!tradePlan.ContainsKey(lastTradeEntityID))
-                Warning(GetLoc("AutoSendMoney-NoPlan"));
+                DLog.Warning(Lang.Get("AutoSendMoney-NoPlan"));
             else
             {
                 tradePlan[lastTradeEntityID] -= currentMoney;
@@ -656,7 +730,7 @@ public unsafe class AutoSendMoney : DailyModuleBase
                 if (tradePlan[lastTradeEntityID] <= 0)
                 {
                     tradePlan.Remove(lastTradeEntityID);
-                    EditPlan.Remove(lastTradeEntityID);
+                    owner.editPlan.Remove(lastTradeEntityID);
                 }
             }
 
@@ -664,16 +738,23 @@ public unsafe class AutoSendMoney : DailyModuleBase
                 StopSelf();
         }
 
-        private void IssueTradeRequest(uint entityID, GameObject* gameObjectAddress)
+        private void IssueTradeRequest
+        (
+            uint        entityID,
+            GameObject* gameObjectAddress
+        )
         {
             TargetSystem.Instance()->Target = gameObjectAddress;
             InventoryManager.Instance()->SendTradeRequest(entityID);
         }
 
-        private bool SetTradeGil(uint money)
+        private bool SetTradeGil
+        (
+            uint money
+        )
         {
             if (!Trade->IsAddonAndNodesReady()) return false;
-            
+
             InventoryManager.Instance()->SetTradeGilAmount(money);
             currentMoney = money;
             return true;
@@ -683,13 +764,16 @@ public unsafe class AutoSendMoney : DailyModuleBase
         {
             if (!Trade->IsAddonAndNodesReady()) return false;
             if (checkState.SelfConfirmed) return true;
-            
+
             Trade->GetComponentButtonById(33)->Click();
             checkState = checkState with { SelfConfirmed = true };
             return true;
         }
 
-        private void OnFrameworkTick(IFramework framework) =>
+        private void OnFrameworkTick
+        (
+            IFramework framework
+        ) =>
             TryQueueNextTrade();
 
         private void TryQueueNextTrade()
@@ -711,18 +795,22 @@ public unsafe class AutoSendMoney : DailyModuleBase
                 if (!pendingTradeRequests.Add(entityID))
                     return;
 
-                taskHelper.DelayNext(GetRandomDelayMS(), $"{nameof(AutoSendMoney)}-IssueTradeRequest");
+                taskHelper.DelayNext(owner.GetRandomDelayMS(), $"{nameof(AutoSendMoney)}-IssueTradeRequest");
                 taskHelper.Enqueue(() => IssueTradeRequest(entityID, (GameObject*)targetAddress), $"{nameof(IssueTradeRequest)}({entityID})");
             }
         }
 
         private void StopSelf()
         {
-            Runtime = null;
+            owner.runtime = null;
             Dispose();
         }
 
-        private bool TrySelectTarget(out uint entityID, out nint address)
+        private bool TrySelectTarget
+        (
+            out uint entityID,
+            out nint address
+        )
         {
             entityID = 0;
             address  = 0;
@@ -762,14 +850,30 @@ public unsafe class AutoSendMoney : DailyModuleBase
             Trade->Callback(1, 0);
         }
 
-        private static void FinalCheckTradeAddon(bool confirm = true)
+        private static void FinalCheckTradeAddon
+        (
+            bool confirm = true
+        )
         {
             if (SelectYesno == null) return;
-            SelectYesno->Callback(confirm ? 0 : 1);
+            SelectYesno->Callback
+            (
+                confirm ?
+                    0 :
+                    1
+            );
         }
 
-        private delegate nint TradeRequestDelegate(InventoryManager* manager, uint entityID);
+        #region 常量
 
-        private delegate nint TradeStatusUpdateDelegate(InventoryManager* manager, nint entityID, nint a3);
+        private static readonly FrozenSet<uint> TradeFinishLogMessages = [10920, 10921, 10922, 10923];
+
+        #endregion
     }
+
+    #region 常量
+
+    private const uint MAXIMUM_GIL_PER_TRADE = 1_000_000;
+
+    #endregion
 }

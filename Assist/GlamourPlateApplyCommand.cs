@@ -1,33 +1,43 @@
-using System;
-using DailyRoutines.Abstracts;
-using DailyRoutines.Managers;
+using DailyRoutines.Common.Module.Abstractions;
+using DailyRoutines.Common.Module.Enums;
+using DailyRoutines.Common.Module.Models;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using OmenTools.Info.Game.Enums;
+using OmenTools.Interop.Game.ExecuteCommand.Implementations;
+using OmenTools.OmenService;
 
 namespace DailyRoutines.ModulesPublic;
 
-public unsafe class GlamourPlateApplyCommand : DailyModuleBase
+public unsafe class GlamourPlateApplyCommand : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
-        Title       = GetLoc("GlamourPlateApplyCommandTitle"),
-        Description = GetLoc("GlamourPlateApplyCommandDescription"),
-        Category    = ModuleCategories.Assist,
+        Title       = Lang.Get("GlamourPlateApplyCommandTitle"),
+        Description = Lang.Get("GlamourPlateApplyCommandDescription"),
+        Category    = ModuleCategory.Assist
     };
 
-    private const string Command = "gpapply";
+    protected override void Init() =>
+        CommandManager.Instance().AddSubCommand(COMMAND, new(OnCommand) { HelpMessage = Lang.Get("GlamourPlateApplyCommand-CommandHelp") });
 
-    protected override void Init() => 
-        CommandManager.AddSubCommand(Command, new(OnCommand) { HelpMessage = GetLoc("GlamourPlateApplyCommand-CommandHelp") });
+    protected override void Uninit() =>
+        CommandManager.Instance().RemoveSubCommand(COMMAND);
 
-    private static void OnCommand(string command, string arguments)
+    private static void OnCommand
+    (
+        string command,
+        string arguments
+    )
     {
-        if (string.IsNullOrWhiteSpace(arguments) ||
-            !int.TryParse(arguments.Trim(), out var index) || index is < 1 or > 20) return;
+        if (string.IsNullOrWhiteSpace(arguments)           ||
+            !int.TryParse(arguments.Trim(), out var index) ||
+            index is < 1 or > 20) return;
 
         var mirageManager = MirageManager.Instance();
+
         if (!mirageManager->GlamourPlatesLoaded)
         {
-            ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.RequestGlamourPlates);
+            ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.RequestGlamourPlate);
             DService.Instance().Framework.RunOnTick(() => ApplyGlamourPlate(index), TimeSpan.FromMilliseconds(500));
             return;
         }
@@ -35,13 +45,19 @@ public unsafe class GlamourPlateApplyCommand : DailyModuleBase
         ApplyGlamourPlate(index);
     }
 
-    private static void ApplyGlamourPlate(int index)
+    private static void ApplyGlamourPlate
+    (
+        int index
+    )
     {
-        ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.EnterGlamourPlateState, 1, 1);
-        ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.ApplyGlamourPlate,      (uint)index - 1);
-        ExecuteCommandManager.Instance().ExecuteCommand(ExecuteCommandFlag.EnterGlamourPlateState, 0, 1);
+        GlamourPlateCommand.Enter();
+        GlamourPlateCommand.ApplyPlate((uint)index - 1);
+        GlamourPlateCommand.Exit();
     }
 
-    protected override void Uninit() => 
-        CommandManager.RemoveSubCommand(Command);
+    #region 常量
+
+    private const string COMMAND = "gpapply";
+
+    #endregion
 }
